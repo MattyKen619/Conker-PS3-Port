@@ -90,7 +90,11 @@ export LIBPATHS := $(LIBPSL1GHT_LIB)
 $(BUILD):
 	@[ -d $@ ] || mkdir -p $@
 	@$(MAKE) --no-print-directory -C $(BUILD) -f $(CURDIR)/Makefile
-pkg: $(BUILD) $(PKGPREP) $(OUTPUT).pkg
+# One after the other, so that -j doesn't link before the build has finished.
+pkg:
+	@$(MAKE) --no-print-directory $(BUILD)
+	@$(if $(PKGPREP),$(MAKE) --no-print-directory $(PKGPREP),true)
+	@$(MAKE) --no-print-directory $(OUTPUT).pkg
 clean:
 	@rm -fr $(BUILD) $(OUTPUT).elf $(OUTPUT).self $(OUTPUT).fake.self $(OUTPUT)*.pkg
 else
