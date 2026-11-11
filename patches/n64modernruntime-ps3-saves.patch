@@ -1,0 +1,195 @@
+--- a/librecomp/src/files.cpp
++++ b/librecomp/src/files.cpp
+@@ -9,7 +9,14 @@ std::ifstream recomp::open_input_backup_file(const std::filesystem::path& filepa
+     return std::ifstream{backup_path, mode};
+ }
+ 
++#if defined(__lv2ppu__)
++static void ps3_make_rw(const std::filesystem::path& p);
++#endif
+ std::ifstream recomp::open_input_file_with_backup(const std::filesystem::path& filepath, std::ios_base::openmode mode) {
++#if defined(__lv2ppu__)
++    ps3_make_rw(filepath);
++    { std::filesystem::path b{filepath}; b += backup_suffix; ps3_make_rw(b); }
++#endif
+     std::ifstream ret{filepath, mode};
+ 
+     // Check if the file failed to open and open the corresponding backup file instead if so.
+@@ -20,14 +27,72 @@ std::ifstream recomp::open_input_file_with_backup(const std::filesystem::path& f
+     return ret;
+ }
+ 
++#if defined(__lv2ppu__)
++#include <cstdio>
++#include <cerrno>
++#include <cstring>
++#include <sys/file.h>
++// PS3: files earlier versions made with std::filesystem::copy_file could come out with no permission
++// bits (unreadable, unwritable: saving failed from then on). Every file the saving touches is made
++// readable and writable first.
++static void ps3_make_rw(const std::filesystem::path& p) {
++    sysFSStat st;
++    if (sysLv2FsStat(p.string().c_str(), &st) == 0 && (st.st_mode & 0600) != 0600) {
++        std::printf("[save] %s had mode %o: making it readable and writable\n", p.string().c_str(), (unsigned)st.st_mode);
++        sysLv2FsChmod(p.string().c_str(), (st.st_mode & ~0777) | 0666);
++    }
++}
++#endif
++
+ std::ofstream recomp::open_output_file_with_backup(const std::filesystem::path& filepath, std::ios_base::openmode mode) {
+     std::filesystem::path temp_path{filepath};
+     temp_path += temp_suffix;
++#if defined(__lv2ppu__)
++    ps3_make_rw(temp_path);
++    ps3_make_rw(filepath);
++    std::ofstream temp_file_out{ temp_path, mode };
++    if (!temp_file_out.good()) std::printf("[save] can't create %s: %s\n", temp_path.string().c_str(), std::strerror(errno));
++    return temp_file_out;
++#else
+     std::ofstream temp_file_out{ temp_path, mode };
+ 
+     return temp_file_out;
++#endif
++}
++
++#if defined(__lv2ppu__)
++// PS3: std::filesystem::copy_file fails on the console's file system (the save never landed), so the
++// copies are done by reading and writing, and each failure is logged.
++static bool ps3_copy_file(const std::filesystem::path& from, const std::filesystem::path& to) {
++    ps3_make_rw(from);
++    ps3_make_rw(to);
++    std::FILE* in = std::fopen(from.string().c_str(), "rb");
++    if (!in) { std::printf("[save] can't open %s: %s\n", from.string().c_str(), std::strerror(errno)); return false; }
++    std::FILE* out = std::fopen(to.string().c_str(), "wb");
++    if (!out) { std::printf("[save] can't create %s: %s\n", to.string().c_str(), std::strerror(errno)); std::fclose(in); return false; }
++    char buf[16384];
++    bool ok = true;
++    for (size_t n; (n = std::fread(buf, 1, sizeof buf, in)) > 0;)
++        if (std::fwrite(buf, 1, n, out) != n) { ok = false; break; }
++    if (std::ferror(in)) ok = false;
++    std::fclose(in);
++    if (std::fclose(out) != 0) ok = false;
++    if (!ok) std::printf("[save] copying %s to %s failed: %s\n", from.string().c_str(), to.string().c_str(), std::strerror(errno));
++    return ok;
+ }
+ 
++bool recomp::finalize_output_file_with_backup(const std::filesystem::path& filepath) {
++    std::filesystem::path backup_path{filepath};
++    backup_path += backup_suffix;
++    std::filesystem::path temp_path{filepath};
++    temp_path += temp_suffix;
++    std::error_code ec;
++    if (std::filesystem::exists(filepath, ec) && !ps3_copy_file(filepath, backup_path)) return false;
++    if (!ps3_copy_file(temp_path, filepath)) return false;
++    std::filesystem::remove(temp_path, ec);
++    return true;
++}
++#else
+ bool recomp::finalize_output_file_with_backup(const std::filesystem::path& filepath) {
+     std::filesystem::path backup_path{filepath};
+     backup_path += backup_suffix;
+@@ -49,3 +114,4 @@ bool recomp::finalize_output_file_with_backup(const std::filesystem::path& filep
+     std::filesystem::remove(temp_path, ec);
+     return true;
+ }
++#endif
+--- a/librecomp/src/pi.cpp
++++ b/librecomp/src/pi.cpp
+@@ -1,3 +1,4 @@
++#include <cstdio>
+ #include <memory>
+ #include <fstream>
+ #include <array>
+@@ -128,6 +129,9 @@ void update_save_file() {
+     if (!saving_failed) {
+         saving_failed = !recomp::finalize_output_file_with_backup(ultramodern::get_save_file_path());
+     }
++#if defined(__lv2ppu__)
++    if (!saving_failed) std::printf("[save] saved %u bytes to %s\n", (unsigned)save_context.save_buffer.size(), ultramodern::get_save_file_path().string().c_str());
++#endif
+     if (saving_failed) {
+         ultramodern::error_handling::message_box("Failed to write to the save file. Check your file permissions and whether the save folder has been moved to Dropbox or similar, as this can cause issues.");
+     }
+@@ -233,10 +237,16 @@ void read_save_file() {
+     std::ifstream save_file = recomp::open_input_file_with_backup(save_file_path, std::ios_base::binary);
+     if (save_file.good()) {
+         save_file.read(save_context.save_buffer.data(), save_context.save_buffer.size());
++#if defined(__lv2ppu__)
++        std::printf("[save] loaded %ld bytes from %s\n", (long)save_file.gcount(), save_file_path.string().c_str());
++#endif
+     }
+     else {
+         // Otherwise clear the save file to all zeroes.
+         std::fill(save_context.save_buffer.begin(), save_context.save_buffer.end(), 0);
++#if defined(__lv2ppu__)
++        std::printf("[save] no save file at %s: starting empty\n", save_file_path.string().c_str());
++#endif
+     }
+ }
+ 
+@@ -266,7 +276,9 @@ void ultramodern::join_saving_thread() {
+     }
+ }
+ 
+-void do_dma(RDRAM_ARG PTR(OSMesgQueue) mq, gpr rdram_address, uint32_t physical_addr, uint32_t size, uint32_t direction) {
++// `mesg` is what the transfer's completion posts to `mq`: libultra's PI manager
++// sends the request's OSIoMesg pointer, and some games (Conker) read it.
++void do_dma(RDRAM_ARG PTR(OSMesgQueue) mq, OSMesg mesg, gpr rdram_address, uint32_t physical_addr, uint32_t size, uint32_t direction) {
+     // TODO asynchronous transfer
+     // TODO implement unaligned DMA correctly
+     if (direction == 0) {
+@@ -275,7 +287,7 @@ void do_dma(RDRAM_ARG PTR(OSMesgQueue) mq, gpr rdram_address, uint32_t physical_
+             recomp::do_rom_read(rdram, rdram_address, physical_addr, size);
+ 
+             // Send a message to the mq to indicate that the transfer completed
+-            ultramodern::enqueue_external_message_src(mq, 0, false, ultramodern::EventMessageSource::Pi);
++            ultramodern::enqueue_external_message_src(mq, mesg, false, ultramodern::EventMessageSource::Pi);
+         } else if (physical_addr >= recomp::sram_base) {
+             if (!recomp::sram_allowed()) {
+                 ultramodern::error_handling::message_box("Attempted to use SRAM saving with other save type");
+@@ -285,7 +297,7 @@ void do_dma(RDRAM_ARG PTR(OSMesgQueue) mq, gpr rdram_address, uint32_t physical_
+             save_read(rdram, rdram_address, physical_addr - recomp::sram_base, size);
+ 
+             // Send a message to the mq to indicate that the transfer completed
+-            ultramodern::enqueue_external_message_src(mq, 0, false, ultramodern::EventMessageSource::Pi);
++            ultramodern::enqueue_external_message_src(mq, mesg, false, ultramodern::EventMessageSource::Pi);
+         } else {
+             fprintf(stderr, "[WARN] PI DMA read from unknown region, phys address 0x%08X\n", physical_addr);
+         }
+@@ -302,7 +314,7 @@ void do_dma(RDRAM_ARG PTR(OSMesgQueue) mq, gpr rdram_address, uint32_t physical_
+             save_write(rdram, rdram_address, physical_addr - recomp::sram_base, size);
+ 
+             // Send a message to the mq to indicate that the transfer completed
+-            ultramodern::enqueue_external_message_src(mq, 0, false, ultramodern::EventMessageSource::Pi);
++            ultramodern::enqueue_external_message_src(mq, mesg, false, ultramodern::EventMessageSource::Pi);
+         } else {
+             fprintf(stderr, "[WARN] PI DMA write to unknown region, phys address 0x%08X\n", physical_addr);
+         }
+@@ -321,7 +333,17 @@ extern "C" void osPiStartDma_recomp(RDRAM_ARG recomp_context* ctx) {
+ 
+     debug_printf("[pi] DMA from 0x%08X into 0x%08X of size 0x%08X\n", devAddr, dramAddr, size);
+ 
+-    do_dma(PASS_RDRAM mq, dramAddr, physical_addr, size, direction);
++    // Fill in the request as libultra does: games can read it back from the
++    // completion message (e.g. Conker matches finished DMAs by mb->dramAddr).
++    OSIoMesg* io = TO_PTR(OSIoMesg, ctx->r4);
++    io->hdr.type = (direction == 0) ? 11 : 12; // OS_MESG_TYPE_DMAREAD / OS_MESG_TYPE_DMAWRITE
++    io->hdr.pri = (u8)pri;
++    io->hdr.retQueue = mq;
++    io->dramAddr = dramAddr;
++    io->devAddr = ctx->r7;
++    io->size = size;
++
++    do_dma(PASS_RDRAM mq, (OSMesg)mb, dramAddr, physical_addr, size, direction);
+ 
+     ctx->r2 = 0;
+ }
+@@ -338,7 +360,7 @@ extern "C" void osEPiStartDma_recomp(RDRAM_ARG recomp_context* ctx) {
+ 
+     debug_printf("[pi] DMA from 0x%08X into 0x%08X of size 0x%08X\n", devAddr, dramAddr, size);
+ 
+-    do_dma(PASS_RDRAM mq, dramAddr, physical_addr, size, direction);
++    do_dma(PASS_RDRAM mq, (OSMesg)ctx->r5, dramAddr, physical_addr, size, direction);
+ 
+     ctx->r2 = 0;
+ }

@@ -1,0 +1,96 @@
+diff --git a/include/recomp.h b/include/recomp.h
+index 73f3e73..9e02529 100644
+--- a/include/recomp.h
++++ b/include/recomp.h
+@@ -83,6 +83,31 @@ static inline void DDIVU(uint64_t a, uint64_t b, uint64_t* quot, uint64_t* rem)
+ 
+ typedef uint64_t gpr;
+ 
++// Byte order of the host. N64 RDRAM is big-endian. Little-endian hosts store it as native 32-bit
++// words, so byte and halfword addresses are XORed to find the right byte within a word. A
++// big-endian host (PS3) stores RDRAM exactly as the N64 does, so no XOR is needed.
++#if defined(__BIG_ENDIAN__) || (defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__)
++    #define RECOMP_BIG_ENDIAN 1
++    #define RECOMP_HALF_XOR 0
++    #define RECOMP_BYTE_XOR 0
++#else
++    #define RECOMP_BIG_ENDIAN 0
++    #define RECOMP_HALF_XOR 2
++    #define RECOMP_BYTE_XOR 3
++#endif
++
++// Offset into the host's RDRAM block of an N64 virtual address (sign-extended to 64 bits).
++// Default: KSEG0 maps to offset 0 (the block is part of a 4GB reservation, so other addresses
++// land in the reservation). PS3: no 4GB reservation is possible, so addresses are masked to 26 bits
++// instead (free on the PPU: one rotate-and-mask replaces the add). KSEG0 and KSEG1 both map to
++// offset 0, and the TLB-mapped segments at 0x15000000 / 0x16000000 land at 16MB / 32MB.
++#if defined(__lv2ppu__)
++    #define RECOMP_MEM_MASK 0x03FFFFFFu
++    #define RECOMP_OFFSET(addr) ((uint32_t)(addr) & RECOMP_MEM_MASK)
++#else
++    #define RECOMP_OFFSET(addr) ((addr) - 0xFFFFFFFF80000000)
++#endif
++
+ #define SIGNED(val) \
+     ((int64_t)(val))
+ 
+@@ -93,23 +118,23 @@ typedef uint64_t gpr;
+     ((gpr)(int32_t)((a) - (b)))
+ 
+ #define MEM_W(offset, reg) \
+-    (*(int32_t*)(rdram + ((((reg) + (offset))) - 0xFFFFFFFF80000000)))
++    (*(int32_t*)(rdram + RECOMP_OFFSET((reg) + (offset))))
+ 
+ #define MEM_H(offset, reg) \
+-    (*(int16_t*)(rdram + ((((reg) + (offset)) ^ 2) - 0xFFFFFFFF80000000)))
++    (*(int16_t*)(rdram + RECOMP_OFFSET(((reg) + (offset)) ^ RECOMP_HALF_XOR)))
+ 
+ #define MEM_B(offset, reg) \
+-    (*(int8_t*)(rdram + ((((reg) + (offset)) ^ 3) - 0xFFFFFFFF80000000)))
++    (*(int8_t*)(rdram + RECOMP_OFFSET(((reg) + (offset)) ^ RECOMP_BYTE_XOR)))
+ 
+ #define MEM_HU(offset, reg) \
+-    (*(uint16_t*)(rdram + ((((reg) + (offset)) ^ 2) - 0xFFFFFFFF80000000)))
++    (*(uint16_t*)(rdram + RECOMP_OFFSET(((reg) + (offset)) ^ RECOMP_HALF_XOR)))
+ 
+ #define MEM_BU(offset, reg) \
+-    (*(uint8_t*)(rdram + ((((reg) + (offset)) ^ 3) - 0xFFFFFFFF80000000)))
++    (*(uint8_t*)(rdram + RECOMP_OFFSET(((reg) + (offset)) ^ RECOMP_BYTE_XOR)))
+ 
+ #define SD(val, offset, reg) { \
+-    *(uint32_t*)(rdram + ((((reg) + (offset) + 4)) - 0xFFFFFFFF80000000)) = (uint32_t)((gpr)(val) >> 0); \
+-    *(uint32_t*)(rdram + ((((reg) + (offset) + 0)) - 0xFFFFFFFF80000000)) = (uint32_t)((gpr)(val) >> 32); \
++    *(uint32_t*)(rdram + RECOMP_OFFSET((reg) + (offset) + 4)) = (uint32_t)((gpr)(val) >> 0); \
++    *(uint32_t*)(rdram + RECOMP_OFFSET((reg) + (offset) + 0)) = (uint32_t)((gpr)(val) >> 32); \
+ }
+ 
+ static inline uint64_t load_doubleword(uint8_t* rdram, gpr reg, gpr offset) {
+@@ -398,8 +423,20 @@ static inline int64_t do_cvt_l_d(double val) {
+ 
+ //#define NAN_CHECK(val)
+ 
++// fl/u32l must alias the low 32 bits of d/u64 on every host, so the member order flips on
++// big-endian hosts.
+ typedef union {
+     double d;
++#if RECOMP_BIG_ENDIAN
++    struct {
++        float fh;
++        float fl;
++    };
++    struct {
++        uint32_t u32h;
++        uint32_t u32l;
++    };
++#else
+     struct {
+         float fl;
+         float fh;
+@@ -408,6 +445,7 @@ typedef union {
+         uint32_t u32l;
+         uint32_t u32h;
+     };
++#endif
+     uint64_t u64;
+ } fpr;
+ 

@@ -1,0 +1,6 @@
+# Regenerates the vertex program header (needs PSL1GHT's cgcomp; no Cg toolkit needed for assembly).
+CGCOMP ?= $(PS3DEV)/bin/cgcomp
+n64gfx_vp.h: n64gfx_vp.asm
+	$(CGCOMP) -a -v $< n64gfx_vp.vpo
+	python3 -c "import sys; d=open('n64gfx_vp.vpo','rb').read(); print('// Generated from n64gfx_vp.asm by: cgcomp -a -v n64gfx_vp.asm n64gfx_vp.vpo (see ps3/gfx/Makefile.shaders)\n#pragma once\n#include <cstdint>\nalignas(16) static const uint8_t n64gfx_vp_vpo[%d] = {' % len(d)); [print('    ' + ', '.join('0x%02x' % b for b in d[i:i+16]) + ',') for i in range(0, len(d), 16)]; print('};')" > $@
+	rm -f n64gfx_vp.vpo

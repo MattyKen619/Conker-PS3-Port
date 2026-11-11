@@ -1,0 +1,38 @@
+# Game data: never commit
+*.z64
+*.n64
+*.v64
+*.rom
+baserom*
+
+# CBFD-Recompiled, fetched and recompiled from your ROM by scripts/setup_upstream.sh
+upstream/
+
+# Build output
+build/
+*.o
+*.d
+*.a
+*.elf
+*.self
+*.fake.self
+*.pkg
+*.sfo
+*.map
+*.log
+pkg/
+app/build/
+app/build-prof/
+app/build-release/
+game/build/
+game/build-prof/
+runtime/build/
+ps3/spu/*/build/
+ps3/spu/*/*.bin
+ps3/spu/*/*.elf
+
+# Your own artwork for the XMB (a game's logo is its publisher's): never commit
+release/*.local.png
+
+# macOS
+.DS_Store

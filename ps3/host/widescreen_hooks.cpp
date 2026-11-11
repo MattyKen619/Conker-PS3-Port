@@ -1,0 +1,721 @@
+// Widescreen on the PS3: the game-side half of the PC version's widescreen (CBFD-Recompiled's
+// host/src/widescreen.cpp, MIT license, Copyright (c) 2026 Sean Ciaschi), called from the hooks its
+// conker.toml puts in the recompiled game. The renderer shows the 3D past the 4:3 edges
+// (ps3/gfx/widescreen.h); these let the game draw what's there: its culls and frustum are widened,
+// and its screen-space sprites, speech bubbles and iris wipe are drawn with RT64's extended GBI
+// (signed rectangle coordinates), which n64gfx reads. Differences from the PC version: the ratio is
+// n64gfx::g_wide_ratio (from the PS3's display), and RT64-only parts (presentation crop, frame
+// interpolation, the Camera: Field of View setting, cutscene pillarboxing) are left out.
+//
+// The original comments follow; "RT64" there is the renderer, here n64gfx.
+
+#include <algorithm>
+#include <atomic>
+#include <cmath>
+#include <cstdint>
+#include <cstring>
+
+#include "recomp.h"
+
+#include "../gfx/widescreen.h"
+#include "settings.h"
+
+namespace {
+    bool motion_blur_this_frame = false;
+
+    // RT64's extended GBI (tools/rt64/include/rt64_extended_gbi.h) for F3DEX2,
+    // whose no-op (0xE0) carries RT64's hooks.
+    constexpr uint32_t rt64_hook_opcode = 0xE0;
+    constexpr uint32_t rt64_hook_magic = 0x525464;
+    constexpr uint32_t rt64_hook_op_enable = 0x1;
+    constexpr uint32_t rt64_extended_opcode = 0x64;
+    constexpr uint32_t g_ex_texrect_v1 = 0x000002;
+    constexpr uint32_t g_ex_origin_none = 0x800;
+
+    float stack_float(uint8_t* rdram, gpr sp, int32_t offset) {
+        uint32_t word = (uint32_t)MEM_W(offset, sp);
+        float value;
+        std::memcpy(&value, &word, sizeof(value));
+        return value;
+    }
+
+    float read_float(uint8_t* rdram, gpr base, int32_t offset) {
+        uint32_t word = (uint32_t)MEM_W(offset, base);
+        float value;
+        std::memcpy(&value, &word, sizeof(value));
+        return value;
+    }
+
+    void write_float(uint8_t* rdram, gpr base, int32_t offset, float value) {
+        uint32_t word;
+        std::memcpy(&word, &value, sizeof(word));
+        MEM_W(offset, base) = (int32_t)word;
+    }
+
+    // How much wider than the game's 4:3 the picture is shown.
+    float widescreen_ratio() { return std::max(1.0f, n64gfx::g_wide_ratio); }
+    float cull_extra() { return 1.0f; }
+    bool no_cull_widen() { return false; }
+
+    // How far past each 4:3 edge sprites are kept, in N64 screen pixels: as far as
+    // the picture reaches past it (half the frame's width, D_800BE620, for each 4:3
+    // width more), and a little more.
+    float sprite_cull_margin(uint8_t* rdram) {
+        const float half_frame = (float)MEM_W(0, (gpr)(int32_t)0x800BE620) * 0.5f;
+        return half_frame * (widescreen_ratio() - 1.0f) + 8.0f;
+    }
+
+    void put_command(uint8_t* rdram, gpr& dl, uint32_t w0, uint32_t w1) {
+        MEM_W(0, dl) = (int32_t)w0;
+        MEM_W(4, dl) = (int32_t)w1;
+        dl += 8;
+    }
+}
+
+// func_15130A9C at 0x15130CEC / 0x15130D08: $f6 and $f10 hold the camera's left
+// and right sprite bounds (camera + 0x2C / + 0x30), about to be compared with the
+// sprite's right and left edges.
+extern "C" void conker_widen_sprite_cull_left(uint8_t* rdram, recomp_context* ctx) {
+    ctx->f6.fl -= sprite_cull_margin(rdram);
+}
+
+extern "C" void conker_widen_sprite_cull_right(uint8_t* rdram, recomp_context* ctx) {
+    ctx->f10.fl += sprite_cull_margin(rdram);
+}
+
+// Screen-space pieces drawn with func_15095D34 (issue #101): the tickly bees of Windy's pollination quest, and the
+// speech bubbles' pieces. func_15095B08 works out a piece's rectangle on screen (D_800D2C78 and on, which
+// func_15095D34 draws) and sets its "on screen" flag (its 6th argument) only where the rectangle overlaps the
+// camera's 4:3 bounds, so in widescreen the bees vanished beside the 4:3 frame (the bees over the hive are
+// func_15130A9C's sprites, widened above). func_15095D34 already draws a piece past either edge of the 4:3 frame
+// (speech bubbles, issue #59, below), so its bounds are widened as the sprites' are. At 0x15095C70 $f8 holds the
+// left bound (camera + 0x2C), compared with the rectangle's right edge; at 0x15095C84 $f10 the right one (camera +
+// 0x30), compared with its left edge.
+extern "C" void conker_widen_piece_cull_left(uint8_t* rdram, recomp_context* ctx) {
+    ctx->f8.fl -= sprite_cull_margin(rdram);
+}
+
+extern "C" void conker_widen_piece_cull_right(uint8_t* rdram, recomp_context* ctx) {
+    ctx->f10.fl += sprite_cull_margin(rdram);
+}
+
+// Light glows: func_151408A4 keeps a glow only while its light's projected point
+// (func_15144CEC) is inside the same camera bounds, so in widescreen glows vanished
+// toward the left and right edges. The glow is a 3D billboard, which RT64 draws
+// anywhere in the widened view; only this check is 4:3. At 0x15140988 $f10 holds the
+// left bound (camera + 0x2C), at 0x151409A0 $f4 the right one (camera + 0x30).
+extern "C" void conker_widen_light_glow_left(uint8_t* rdram, recomp_context* ctx) {
+    ctx->f10.fl -= sprite_cull_margin(rdram);
+}
+
+extern "C" void conker_widen_light_glow_right(uint8_t* rdram, recomp_context* ctx) {
+    ctx->f4.fl += sprite_cull_margin(rdram);
+}
+
+// func_15130A9C at 0x15130DA0: the game has just written a G_RDPPIPESYNC at $v0,
+// the first command of the sprite. RT64 doesn't need syncs; put the enable of its
+// extended GBI there instead (RT64 turns it off at the start of every display
+// list), so the extended rectangle below costs no extra display list space. The
+// sprites are drawn into display lists allocated to fit what the game writes.
+extern "C" void conker_enable_extended_gbi(uint8_t* rdram, recomp_context* ctx) {
+    gpr dl = ctx->r2;
+    put_command(rdram, dl, (rt64_hook_opcode << 24) | rt64_hook_magic, (rt64_hook_op_enable << 28) | rt64_extended_opcode);
+}
+
+// func_15130A9C at 0x15131168: $v0 is where the sprite's G_TEXRECT goes (three
+// commands: the rectangle and its two G_RDPHALF words). The game clamps its corners
+// to 0 and moves the texture start instead; emit the unclamped rectangle as an
+// extended one, which is also three commands. RT64 (rt64.patch) clips a rectangle
+// whose scissor spans the frame at the edges of the widened frame. The function
+// then continues at its end (L_15131360), which returns sp + 0x100.
+extern "C" void conker_emit_sprite_texrect(uint8_t* rdram, recomp_context* ctx) {
+    gpr sp = ctx->r29;
+    // Corners in 10.2 fixed point, already scaled by 4.
+    int32_t ulx = (int32_t)stack_float(rdram, sp, 0xBC);
+    int32_t uly = (int32_t)stack_float(rdram, sp, 0xB8);
+    int32_t lrx = (int32_t)stack_float(rdram, sp, 0xB4);
+    int32_t lry = (int32_t)stack_float(rdram, sp, 0xB0);
+    // Texture start (s10.5) and steps (s5.10), including the flips' adjustments.
+    uint32_t s = (uint32_t)MEM_W(0x98, sp) & 0xFFFF;
+    uint32_t t = (uint32_t)MEM_W(0x94, sp) & 0xFFFF;
+    uint32_t dsdx = (uint32_t)MEM_W(0x90, sp) & 0xFFFF;
+    uint32_t dtdy = (uint32_t)MEM_W(0x8C, sp) & 0xFFFF;
+    const uint32_t tile = 0;
+
+    gpr dl = ctx->r2;
+    put_command(rdram, dl, (rt64_extended_opcode << 24) | g_ex_texrect_v1,
+        tile | (g_ex_origin_none << 3) | (g_ex_origin_none << 15));
+    put_command(rdram, dl, ((uint32_t)(ulx & 0xFFFF) << 16) | (uint32_t)(uly & 0xFFFF),
+        ((uint32_t)(lrx & 0xFFFF) << 16) | (uint32_t)(lry & 0xFFFF));
+    put_command(rdram, dl, (s << 16) | t, (dsdx << 16) | dtdy);
+    MEM_W(0x100, sp) = (int32_t)dl;
+}
+
+// Speech bubbles (issue #59). func_15095D34 draws each piece of a cutscene's speech bubble (its
+// halves, mirrored, and its tail) as a G_TEXRECT: the left edge from $f12 (D_800D2C78, truncated
+// at 0x15095E78), the right edge that plus a width (its 5th argument and D_800D2C84 less one:
+// $f12 is 1.0 by then, 0x15095F18), the texture start from $f12's fraction. Like the sprites, a piece past the
+// screen's left edge is clamped to 0 and its texture moved on, so a bubble near the edge was cut at
+// the 4:3 edge in widescreen, the widened picture beside it.
+//
+// In widescreen a piece whose left edge is near or past the screen's is drawn that many whole
+// pixels to the right (its left edge, which the right one follows; whole pixels, so the texture
+// start is the same), which the game doesn't clamp, and its rectangle is then moved back as RT64's
+// extended one, whose coordinates can be negative. The game writes the corners in 12 bits, so on
+// very wide screens a piece far to the right has its right edge wrapped past 1024 pixels; that one
+// is unwrapped and rewritten the same way.
+//
+// The extended GBI has to be enabled in the frame before that, and the bubbles write no sync to
+// put the enable in. RT64 keeps it on from the enable to the end of the frame, so it's enabled
+// early, in place of the pipe sync each camera's pass starts with; the bubbles are only moved in
+// frames where that happened.
+namespace {
+    constexpr float bubble_margin = 8.0f; // pixels kept right of the screen's left edge
+    constexpr uint32_t bubble_texrect = 0xE4; // G_TEXRECT
+    bool extended_enabled = false;
+    gpr bubble_dl_start = 0;
+    int32_t bubble_shift = 0;
+}
+
+// func_1501878C, as it starts the frame's display list.
+void conker_shadows_game_frame();  // interpolation_hooks.cpp
+
+extern "C" void conker_frame_dl_begin(uint8_t* rdram, recomp_context* ctx) {
+    (void)rdram; (void)ctx;
+    extended_enabled = false;
+    conker_shadows_game_frame();
+}
+
+// func_15019464, just after func_1501A490 wrote a pipe sync and the camera's scissor ($v0 after them).
+extern "C" void conker_camera_pass_sync(uint8_t* rdram, recomp_context* ctx) {
+    gpr sync = ctx->r2 - 16;
+    if ((uint32_t)MEM_W(0, sync) != 0xE7000000 || MEM_W(4, sync) != 0) {
+        return;
+    }
+    put_command(rdram, sync, (rt64_hook_opcode << 24) | rt64_hook_magic, (rt64_hook_op_enable << 28) | rt64_extended_opcode);
+    extended_enabled = true;
+}
+
+// func_15095D34, after $f12 (the piece's left edge) is loaded; its display list ($a0) is at $sp + 0x88.
+extern "C" void conker_bubble_begin(uint8_t* rdram, recomp_context* ctx) {
+    bubble_dl_start = 0;
+    bubble_shift = 0;
+    if (!extended_enabled || widescreen_ratio() <= 1.0f) {
+        return;
+    }
+    const gpr sp = ctx->r29;
+    bubble_dl_start = (gpr)MEM_W(0x88, sp);
+    if (ctx->f12.fl < bubble_margin) {
+        bubble_shift = (int32_t)std::ceil(bubble_margin - ctx->f12.fl);
+        ctx->f12.fl += (float)bubble_shift;
+    }
+}
+
+// At its return: $v0 is the end of what it wrote.
+extern "C" void conker_bubble_end(uint8_t* rdram, recomp_context* ctx) {
+    const gpr start = bubble_dl_start;
+    const int32_t shift = bubble_shift;
+    bubble_dl_start = 0;
+    bubble_shift = 0;
+    if (start == 0) {
+        return;
+    }
+    const gpr end = ctx->r2;
+    for (gpr cmd = start; cmd + 24 <= end && end - start <= 0x40; cmd += 8) {
+        const uint32_t w0 = (uint32_t)MEM_W(0, cmd);
+        if ((w0 >> 24) != bubble_texrect || ((uint32_t)MEM_W(8, cmd) >> 24) != 0xE1 || ((uint32_t)MEM_W(16, cmd) >> 24) != 0xF1) {
+            continue;
+        }
+        const uint32_t w1 = (uint32_t)MEM_W(4, cmd);
+        int32_t lrx = (int32_t)((w0 >> 12) & 0xFFF), lry = (int32_t)(w0 & 0xFFF);
+        int32_t ulx = (int32_t)((w1 >> 12) & 0xFFF), uly = (int32_t)(w1 & 0xFFF);
+        const uint32_t tile = (w1 >> 24) & 0x7;
+        if (lrx < ulx) {
+            lrx += 0x1000; // past the 12 bits
+        } else if (shift == 0) {
+            break; // drawn as the game wrote it
+        }
+        ulx -= shift * 4;
+        lrx -= shift * 4;
+        const uint32_t st = (uint32_t)MEM_W(12, cmd), steps = (uint32_t)MEM_W(20, cmd);
+        gpr dl = cmd;
+        put_command(rdram, dl, (rt64_extended_opcode << 24) | g_ex_texrect_v1, tile | (g_ex_origin_none << 3) | (g_ex_origin_none << 15));
+        put_command(rdram, dl, ((uint32_t)(ulx & 0xFFFF) << 16) | (uint32_t)(uly & 0xFFFF), ((uint32_t)(lrx & 0xFFFF) << 16) | (uint32_t)(lry & 0xFFFF));
+        put_command(rdram, dl, st, steps);
+        break;
+    }
+}
+
+// func_151D5E90 (and func_151D6418) draw a saved copy of the frame, such as the
+// pause menu's blurred background, as 42 textured tiles. The copy only holds the
+// 4:3 frame, so RT64 draws the tiles in the 4:3 area and the widened sides show
+// the game frozen behind them. Scale the tiles up to the whole width instead,
+// and as much vertically, so the frame keeps its proportions and loses some of
+// its top and bottom, with RT64's rect aspect (zoom, from rt64.patch). The tiles
+// are full of load and pipe syncs, which RT64 doesn't need: before the first
+// rectangle, the first sync becomes the enable of RT64's extended GBI and the
+// second the zoom; the last sync, after the last rectangle, returns to the
+// automatic aspect. The display list doesn't grow.
+//
+// Not for the motion blur (func_151D6778, e.g. Conker drunk at the start of the game), which
+// uses both every frame on its own copy of the frame (D_800BE570): it draws the copy over the
+// frame, then copies the frame into it. That copy is RT64's widened frame and is drawn back
+// across the whole width already, and zooming it each frame zoomed the last frame's ghost
+// again on every pass, dragging the picture into streaks.
+namespace {
+    constexpr uint32_t motion_blur_copy = 0x800BE570; // D_800BE570
+    constexpr uint32_t g_ex_setrectaspect_v1 = 0x000033;
+    constexpr uint32_t g_ex_aspect_auto = 0x0;
+    constexpr uint32_t g_ex_aspect_zoom = 0x3;
+    constexpr uint32_t g_texrect = 0xE4;
+
+    gpr frame_copy_dl_start = 0;
+
+    bool is_sync(uint8_t* rdram, gpr cmd) {
+        uint32_t w0 = (uint32_t)MEM_W(0, cmd);
+        return (w0 == 0xE6000000 || w0 == 0xE7000000 || w0 == 0xE8000000) && MEM_W(4, cmd) == 0;
+    }
+}
+
+// The motion blur blends each frame with its copy of the last one. RT64's frames between the game's
+// (above 30 frames a second) are blended with that copy too, which is then a fraction of a frame old,
+// not a whole one: the ghosts all but covered the picture and the blur was nearly gone (issue #77, Conker
+// drunk). A frame the blur is drawn in is drawn without frames between it and the next (rt64.patch,
+// RT64::setInterpolationPaused), at the game's own rate as on the N64.
+// func_151D6778 (the motion blur), after its first instruction.
+std::atomic<bool> g_conker_motion_blur{false};  // the renderer draws no in-between frame for it
+extern "C" void conker_motion_blur(uint8_t* rdram, recomp_context* ctx) { (void)rdram; (void)ctx; g_conker_motion_blur = true; }
+
+// At the start of the function: $a0 is where it writes its first command, $a1 the image it
+// draws from.
+extern "C" void conker_frame_copy_begin(uint8_t* rdram, recomp_context* ctx) {
+    frame_copy_dl_start = ctx->r4;
+    const uint32_t blur_copy = (uint32_t)MEM_W(0, (gpr)(int32_t)motion_blur_copy);
+    if (blur_copy == 0) {
+        return;
+    }
+    // The motion blur draws its copy (func_151D6418 from D_800BE570), or copies the frame into
+    // it (func_151D5E90 just after its colour image was set to D_800BE570).
+    const bool draws_copy = (uint32_t)ctx->r5 == blur_copy;
+    const bool fills_copy = ((uint32_t)MEM_W(-16, ctx->r4) >> 24) == 0xFF && (uint32_t)MEM_W(-12, ctx->r4) == blur_copy;
+    if (draws_copy || fills_copy) {
+        frame_copy_dl_start = 0;
+    }
+}
+
+// At its return: $v0 is the end of what it wrote.
+extern "C" void conker_frame_copy_end(uint8_t* rdram, recomp_context* ctx) {
+    gpr start = frame_copy_dl_start;
+    gpr end = ctx->r2;
+    frame_copy_dl_start = 0;
+    if (start == 0 || end <= start || end - start > 0x10000) {
+        return;
+    }
+    gpr syncs_before[2] = { 0, 0 };
+    int before_count = 0;
+    gpr last_rect = 0;
+    gpr last_sync = 0;
+    for (gpr cmd = start; cmd < end; cmd += 8) {
+        if (((uint32_t)MEM_W(0, cmd) >> 24) == g_texrect) {
+            last_rect = cmd;
+            cmd += 16; // its two RDPHALF words
+        }
+        else if (is_sync(rdram, cmd)) {
+            if (last_rect == 0 && before_count < 2) {
+                syncs_before[before_count++] = cmd;
+            }
+            last_sync = cmd;
+        }
+    }
+    if (before_count < 2 || last_rect == 0 || last_sync < last_rect) {
+        return;
+    }
+    gpr dl = syncs_before[0];
+    put_command(rdram, dl, (rt64_hook_opcode << 24) | rt64_hook_magic, (rt64_hook_op_enable << 28) | rt64_extended_opcode);
+    dl = syncs_before[1];
+    put_command(rdram, dl, (rt64_extended_opcode << 24) | g_ex_setrectaspect_v1, g_ex_aspect_zoom);
+    dl = last_sync;
+    put_command(rdram, dl, (rt64_extended_opcode << 24) | g_ex_setrectaspect_v1, g_ex_aspect_auto);
+}
+
+// func_15180580 draws the circle wipe of spawning, dying and changing levels: black
+// rectangles around the circle, clipped to the camera, and the circle's four
+// quarters as texture rectangles, whose left edges are clamped to 0. RT64 widens
+// the rectangles that touch one side of the frame, but when the circle is wider
+// than the 4:3 frame, the side rectangles are empty and aren't drawn, and the left
+// quarters are cut at 0, so the widened sides show the game through the wipe.
+//
+// The wipe is rewritten into a display list of our own: the black rectangles
+// become RT64's extended ones, with signed coordinates reaching past the frame's
+// edges, and the left quarters extended texture rectangles starting where the
+// circle does. The display list the game wrote into can't grow, so its first
+// command becomes a branch to ours, which branches back to where the game's
+// continues. Ours are in RDRAM past the game's 8 MB, where RT64 can still read
+// them (it masks addresses to 16 MB) and mods don't load (from 0x81000000).
+namespace {
+    constexpr uint32_t g_ex_fillrect_v1 = 0x000003;
+    constexpr uint32_t g_dl_branch = 0xDE010000;
+    constexpr uint32_t wide_dl_start = 0x00F00000;
+    // A ring of display lists: RT64 has long finished with one when it comes round again.
+    constexpr uint32_t wide_dl_size = 0x10000;
+    uint32_t wide_dl_offset = 0;
+
+    // Beyond the frame's sides, in N64 screen pixels. The scissor clips the rest.
+    constexpr int32_t wide_reach = 1024;
+    // The cameras (D_800BE628, 0x180 bytes each) and their clip bounds.
+    constexpr gpr cameras_pointer = (gpr)(int32_t)0x800BE628;
+    constexpr uint32_t camera_size = 0x180;
+    constexpr int32_t camera_top = 0x24, camera_bottom = 0x28, camera_left = 0x2C, camera_right = 0x30;
+
+    gpr iris_dl_start = 0;
+    int32_t iris_camera = 0;
+
+    struct Command {
+        uint32_t w0, w1;
+        uint32_t op() const { return w0 >> 24; }
+    };
+
+    int32_t camera_bound(uint8_t* rdram, int32_t camera, int32_t field) {
+        gpr base = (gpr)MEM_W(0, cameras_pointer) + camera * camera_size;
+        uint32_t word = (uint32_t)MEM_W(field, base);
+        float value;
+        std::memcpy(&value, &word, sizeof(value));
+        return (int32_t)value;
+    }
+
+    void put_fill(uint8_t* rdram, gpr& dl, int32_t ulx, int32_t uly, int32_t lrx, int32_t lry) {
+        if (lrx <= ulx || lry <= uly) {
+            return;
+        }
+        put_command(rdram, dl, (rt64_extended_opcode << 24) | g_ex_fillrect_v1, g_ex_origin_none | (g_ex_origin_none << 12));
+        put_command(rdram, dl, ((uint32_t)(ulx * 4) << 16) | ((uint32_t)(uly * 4) & 0xFFFF),
+            ((uint32_t)(lrx * 4) << 16) | ((uint32_t)(lry * 4) & 0xFFFF));
+    }
+}
+
+// At the start of the function: $a0 is where it writes its first command, $a1 the camera.
+extern "C" void conker_iris_begin(uint8_t* rdram, recomp_context* ctx) {
+    iris_dl_start = ctx->r4;
+    iris_camera = (int32_t)ctx->r5;
+}
+
+// At its return: $v0 is the end of what it wrote.
+extern "C" void conker_iris_end(uint8_t* rdram, recomp_context* ctx) {
+    gpr start = iris_dl_start;
+    gpr end = ctx->r2;
+    iris_dl_start = 0;
+    constexpr size_t max_commands = 64;
+    if (start == 0 || end <= start || end - start > max_commands * 8) {
+        return;
+    }
+    Command cmds[max_commands];
+    size_t count = (size_t)(end - start) / 8;
+    for (size_t i = 0; i < count; i++) {
+        cmds[i] = { (uint32_t)MEM_W(i * 8, start), (uint32_t)MEM_W(i * 8 + 4, start) };
+    }
+
+    // The wipe in progress: 8 commands of setup (a display list call first), the
+    // black rectangles, the texture's setup, the four quarters (a G_TEXRECT and its
+    // two G_RDPHALF words each: below right, above left, above right, below left)
+    // and the geometry mode's restore. Anything else is left as the game drew it.
+    constexpr size_t setup_count = 8;
+    if (count < setup_count || cmds[0].op() != 0xDE) {
+        return;
+    }
+    size_t texture_setup = setup_count;
+    while (texture_setup < count && cmds[texture_setup].op() == 0xF6) {
+        texture_setup++;
+    }
+    constexpr size_t quarter_count = 4;
+    if (count < texture_setup + quarter_count * 3 + 2) {
+        return;
+    }
+    size_t quarters = count - 1 - quarter_count * 3;
+    if (cmds[count - 1].op() != 0xD9) {
+        return;
+    }
+    for (size_t i = texture_setup; i < quarters; i++) {
+        if (cmds[i].op() == 0xE4 || cmds[i].op() == 0xF6) {
+            return;
+        }
+    }
+    for (size_t q = 0; q < quarter_count; q++) {
+        const Command* rect = &cmds[quarters + q * 3];
+        if (rect[0].op() != 0xE4 || rect[1].op() != 0xE1 || rect[2].op() != 0xF1) {
+            return;
+        }
+    }
+    auto ulx = [&](size_t q) { return (int32_t)((cmds[quarters + q * 3].w1 >> 12) & 0xFFF); };
+    auto uly = [&](size_t q) { return (int32_t)(cmds[quarters + q * 3].w1 & 0xFFF); };
+    auto lrx = [&](size_t q) { return (int32_t)((cmds[quarters + q * 3].w0 >> 12) & 0xFFF); };
+    auto lry = [&](size_t q) { return (int32_t)(cmds[quarters + q * 3].w0 & 0xFFF); };
+    // The circle, in 10.2 fixed point, from the unclamped quarter below right.
+    int32_t cx4 = ulx(0);
+    int32_t cy4 = uly(0);
+    int32_t r4 = lrx(0) - cx4;
+    if (r4 <= 0 || lry(0) - cy4 != r4 || lrx(1) != cx4 || lrx(3) != cx4) {
+        return;
+    }
+
+    uint32_t needed = (1 + (uint32_t)count + quarter_count * 2 + 1) * 8;
+    if (wide_dl_offset + needed > wide_dl_size) {
+        wide_dl_offset = 0;
+    }
+    uint32_t wide_dl = wide_dl_start + wide_dl_offset;
+    wide_dl_offset += (needed + 15) & ~15u;
+    gpr dl = (gpr)(int32_t)(0x80000000u | wide_dl);
+
+    put_command(rdram, dl, (rt64_hook_opcode << 24) | rt64_hook_magic, (rt64_hook_op_enable << 28) | rt64_extended_opcode);
+    for (size_t i = 0; i < setup_count; i++) {
+        put_command(rdram, dl, cmds[i].w0, cmds[i].w1);
+    }
+
+    // The black around the circle: bands above and below it, and its sides, which
+    // reach past the frame's edges where the camera touches them.
+    int32_t top = camera_bound(rdram, iris_camera, camera_top);
+    int32_t bottom = camera_bound(rdram, iris_camera, camera_bottom);
+    int32_t left = camera_bound(rdram, iris_camera, camera_left);
+    int32_t right = camera_bound(rdram, iris_camera, camera_right);
+    int32_t cx = cx4 / 4, cy = cy4 / 4, r = r4 / 4;
+    // A full-screen camera is clipped to 2..290; split-screen ones stop in the middle.
+    int32_t wide_left = left <= 4 ? left - wide_reach : left;
+    int32_t wide_right = right >= 286 ? right + wide_reach : right;
+    int32_t band_top = std::max(top, cy - r);
+    int32_t band_bottom = std::min(bottom, cy + r);
+    put_fill(rdram, dl, wide_left, top, wide_right, band_top);
+    put_fill(rdram, dl, wide_left, band_bottom, wide_right, bottom);
+    put_fill(rdram, dl, wide_left, band_top, std::min(cx - r, wide_right), band_bottom);
+    put_fill(rdram, dl, std::max(cx + r, wide_left), band_top, wide_right, band_bottom);
+
+    for (size_t i = texture_setup; i < quarters; i++) {
+        put_command(rdram, dl, cmds[i].w0, cmds[i].w1);
+    }
+    for (size_t q = 0; q < quarter_count; q++) {
+        const Command* rect = &cmds[quarters + q * 3];
+        bool left_quarter = q == 1 || q == 3;
+        if (!left_quarter || cx4 - r4 >= 0) {
+            put_command(rdram, dl, rect[0].w0, rect[0].w1);
+            put_command(rdram, dl, rect[1].w0, rect[1].w1);
+            put_command(rdram, dl, rect[2].w0, rect[2].w1);
+            continue;
+        }
+        // Undo the clamp: move the texture start back to where the circle starts.
+        int32_t new_ulx = cx4 - r4;
+        int32_t dsdx = (int16_t)(rect[2].w1 >> 16);
+        int32_t s = (int16_t)(rect[1].w1 >> 16) + ((new_ulx * dsdx) >> 7);
+        uint32_t t = rect[1].w1 & 0xFFFF;
+        const uint32_t tile = (rect[0].w1 >> 24) & 0x7;
+        put_command(rdram, dl, (rt64_extended_opcode << 24) | g_ex_texrect_v1,
+            tile | (g_ex_origin_none << 3) | (g_ex_origin_none << 15));
+        put_command(rdram, dl, ((uint32_t)new_ulx << 16) | (uint32_t)uly(q),
+            ((uint32_t)lrx(q) << 16) | (uint32_t)lry(q));
+        put_command(rdram, dl, ((uint32_t)s << 16) | t, rect[2].w1);
+    }
+    put_command(rdram, dl, cmds[count - 1].w0, cmds[count - 1].w1);
+    put_command(rdram, dl, g_dl_branch, (uint32_t)end & 0x00FFFFFF);
+
+    // The game's first command branches to ours; the rest of its wipe is skipped.
+    gpr game_dl = start;
+    put_command(rdram, game_dl, g_dl_branch, wide_dl);
+}
+
+// func_1501B22C builds a camera's frustum from its fields of view: the view-space
+// normals of its four side planes, which the game culls the world and its objects
+// against. RT64 widens the picture, but those planes still hold the 4:3 view, so
+// the level's pieces past the 4:3 edges weren't drawn (holes at the sides, and
+// geometry popping in and out as the camera turned). At its return ($s0 is the
+// camera), rebuild the left and right planes from the horizontal field of view
+// as wide as the window shows it: tan(half angle) grows with the aspect ratio.
+extern "C" void conker_widen_frustum(uint8_t* rdram, recomp_context* ctx) {
+    const float ratio = widescreen_ratio();
+    if (ratio <= 1.0f || no_cull_widen()) {
+        return;
+    }
+    const gpr camera = ctx->r16;
+    constexpr float degrees_to_radians = 3.14159265358979f / 180.0f;
+    const float half_x = read_float(rdram, camera, 0x74) * 0.5f * degrees_to_radians;
+    const float wide_half_x = std::min(std::atan(std::tan(half_x) * ratio * cull_extra()), 1.5f);
+    const float c = std::cos(wide_half_x);
+    const float s = std::sin(wide_half_x);
+    // Left (cos, 0, -sin) and right (-cos, 0, -sin), as the game writes them.
+    write_float(rdram, camera, 0x88, c);
+    write_float(rdram, camera, 0x8C, 0.0f);
+    write_float(rdram, camera, 0x90, -s);
+    write_float(rdram, camera, 0x94, -c);
+    write_float(rdram, camera, 0x98, 0.0f);
+    write_float(rdram, camera, 0x9C, -s);
+}
+
+// func_151103C8 fills the camera's view with its background colour (D_800DBEA8) before it's drawn:
+// from its left bound to its right one less a pixel (290 - 1 for a camera across the frame, 289 in
+// fill mode's inclusive coordinates, so the fill ends just at the scissor's edge). RT64 lines a
+// rectangle that reaches the scissor's edge up with the window's, so in widescreen its last column
+// went out to the window's right side. In play the widened 3D covers it; on the screens before the
+// N64 logo, which draw only a picture over the 4:3 frame, it showed as a thin blue line near the
+// right edge. At 0x15110458, just before the fill ($a3 its right edge), a fill that reaches the edge
+// ends a pixel short, inside the frame: the picture or the 3D drawn over it covers that pixel.
+// n64gfx extends a fill reaching the scissor's sides into the margins (widescreen.h), which is what
+// clears them each frame; shortening it (as the PC version does for RT64) left them uncleared.
+extern "C" void conker_camera_background_fill(uint8_t* rdram, recomp_context* ctx) { (void)rdram; (void)ctx; }
+
+// updateCullScales_1510B958 sets the scale that the game's other culls (the level's
+// pieces among them: func_150A5378, func_150A6210, func_1510AEE0) multiply a
+// view-space x by before comparing it with the depth: a point is kept while
+// |x| * scale <= depth, the 4:3 view. At its return, divide it by how much wider
+// the window is, so they keep what the widened view shows.
+extern "C" void conker_widen_cull_scale(uint8_t* rdram, recomp_context* ctx) {
+    const float ratio = widescreen_ratio();
+    if (ratio <= 1.0f || no_cull_widen()) {
+        return;
+    }
+    const gpr cull_scale_x = (gpr)(int32_t)0x800D35E0; // cullScaleX_800D35E0
+    write_float(rdram, cull_scale_x, 0, read_float(rdram, cull_scale_x, 0) / (ratio * cull_extra()));
+}
+
+// Some levels' backdrop (sky and distant scenery) is a grid of cells: func_15110CFC splits
+// it down to the cells in view (sphere tests, func_150A6210, with the widened cull scale)
+// and writes 4 vertices per cell into a buffer func_15000AD0 allocates per camera, two
+// halves of 448 vertices, one per frame in flight. It never checks the end: Rare's 4:3
+// view can't hold more cells than that, but a wide one can, and the extra vertices
+// overran the next heap block (a crash in the heap walk, func_10004250, looking at the
+// sky on ultrawide screens and in the duct tape and exploding mouse cutscenes). At
+// 0x15000B80 $s1 holds the block's size and $v1 the second half's offset: make both
+// four times as big, enough for a 32:9 view with room to spare (43 KB more a camera).
+namespace {
+    constexpr uint32_t backdrop_buffer_scale = 4;
+}
+
+extern "C" void conker_widen_backdrop_buffers(uint8_t* rdram, recomp_context* ctx) {
+    ctx->r17 = (gpr)(int64_t)(int32_t)((uint32_t)ctx->r17 * backdrop_buffer_scale);
+    ctx->r3 = (gpr)(int64_t)(int32_t)((uint32_t)ctx->r3 * backdrop_buffer_scale);
+}
+
+// func_15111AF4 draws the backdrop (sky and distant scenery) in sectors around the
+// camera, and only those whose middle is within $f0 degrees of the way it looks: 95 (80
+// in split screen), room for Rare's 4:3 view (30 degrees each side), half a sector (45)
+// and some to spare. A wider view reaches further each side, and further still when
+// it looks up: its top corners sweep across more directions, and looking steeply up
+// it takes in nearly all of them. So the outermost sectors weren't drawn, and the sky's
+// edges showed at the sides. At 0x15111BC4, just after $f0 is set, let in every sector
+// the view's corners can reach: from the window's horizontal field of view, the
+// camera's vertical one and how far it looks up or down (its view matrix, D_800D9C10).
+extern "C" void conker_widen_backdrop_sectors(uint8_t* rdram, recomp_context* ctx) {
+    const float ratio = widescreen_ratio();
+    if (ratio <= 1.0f) {
+        return;
+    }
+    constexpr float degrees_to_radians = 3.14159265358979f / 180.0f;
+    constexpr float half_sector = 45.0f, spare = 10.0f;
+    const uint32_t camera_index = (uint32_t)MEM_W(0, (gpr)(int32_t)0x80082FA4); // D_80082FA4
+    const gpr camera = (gpr)(int32_t)MEM_W(0, (gpr)(int32_t)0x800BE628) + (gpr)(int32_t)(camera_index * 0x180);
+    const gpr view = (gpr)(int32_t)(0x800D9C10 + camera_index * 0x40);
+    const float half_x = std::atan(std::tan(read_float(rdram, camera, 0x74) * 0.5f * degrees_to_radians) * ratio);
+    const float half_y = read_float(rdram, camera, 0x78) * 0.5f * degrees_to_radians;
+    // The camera looks along -z of its view: the y part of that is its pitch.
+    const float pitch = std::asin(std::clamp(-read_float(rdram, view, 0x18), -1.0f, 1.0f));
+    const float corner_pitch = std::fabs(pitch) + half_y;
+    float reach = 180.0f;
+    if (corner_pitch < 89.0f * degrees_to_radians) {
+        reach = std::atan(std::tan(half_x) / std::cos(corner_pitch)) / degrees_to_radians + half_sector + spare;
+    }
+    ctx->f0.fl = std::max(ctx->f0.fl, std::min(reach, 180.0f));
+}
+
+// From the PC version's render_fixes.cpp: the frame's display lists get more room, for widescreen's
+// wider view and frame interpolation's matrix groups.
+// Room in the frame's display lists (issue #98: a crash leaving Spooky, after the barrel ride).
+//
+// func_15015E80 (as a level loads) allocates the two display lists the frames are drawn into, one
+// for each frame in turn, from the game's heap: as many commands as the scene's budget (its data's
+// +0x1C, 8000 if none; 4000 in the lava level) and 400 more, 8 bytes each. It stores the budget as
+// a limit (D_800BEBA4): while drawing, the game stops adding objects once a list holds more commands
+// than that, and the 400 more are for what's drawn after, unchecked (the HUD, the frame's end...).
+//
+// Two things made a frame need more than the original did: the frame interpolation's matrix groups
+// (interpolation.cpp: 4 commands for each object and each shadow drawn), and widescreen, whose wider
+// view draws the objects beside the 4:3 frame too. In a busy scene the budget ran out: the game
+// stopped drawing objects (in the report, the water and every object vanished), and what came after
+// ran past the list's end, over the next heap block's header. The game frees the level's blocks as it
+// leaves the level (func_15019130, by func_10004250, which walks the heap's blocks), and walking
+// into the overwritten header crashed (a segfault in func_10004250). And the limit isn't the list's
+// size: it's worked out from how far apart the two lists are, which is their size only if the heap
+// put them side by side. At the title it hadn't (another block between them): the limit was 11830 for
+// lists of 6400 commands, so a list could run past its end with nothing to stop it.
+//
+// So each list gets half the budget again (at least 1000 commands: 32-64KB of the heap, which has
+// some 850KB free in a level), and the limit is the list's own size less 800 (twice the game's room
+// for what's drawn unchecked, for the interpolation's groups among it).
+
+namespace {
+    constexpr uint32_t scene_data = 0x800B0DF0;      // D_800B0DF0: the scene's data
+    constexpr uint32_t display_list_room = 400;      // the game's, for what's drawn unchecked
+
+    // The commands the game allocates a list for: the budget and its 400 (the scene's data at +0x1C,
+    // once func_15015E80 has added them).
+    uint32_t game_list_commands(uint8_t* rdram) {
+        const gpr scene = (gpr)MEM_W(0, (gpr)(int32_t)scene_data);
+        return (uint32_t)MEM_HU(0x1C, scene);
+    }
+
+    uint32_t list_commands(uint8_t* rdram) {
+        const uint32_t game = game_list_commands(rdram);
+        const uint32_t budget = game > display_list_room ? game - display_list_room : 0;
+        return game + std::max<uint32_t>(budget / 2, 1000);
+    }
+}
+
+// func_15015E80 at 0x15015ED0 and 0x15015F00, as it allocates each list: $t9 (the first) and $t2
+// (the second) are its size in bytes, passed to the allocator in the call's delay slot.
+extern "C" void conker_display_list_size_first(uint8_t* rdram, recomp_context* ctx) {
+    ctx->r25 = (gpr)(int32_t)(list_commands(rdram) * 8);
+}
+
+extern "C" void conker_display_list_size_second(uint8_t* rdram, recomp_context* ctx) {
+    ctx->r10 = (gpr)(int32_t)(list_commands(rdram) * 8);
+}
+
+// At 0x15015F28, as it stores the limit (D_800BEBA4) from $t7.
+extern "C" void conker_display_list_limit(uint8_t* rdram, recomp_context* ctx) {
+    ctx->r15 = (gpr)(int32_t)(list_commands(rdram) - 2 * display_list_room);
+}
+
+// Cutscenes in 4:3 (the startup menu's Cutscenes setting; the PC version's cutscene_aspect.cpp, MIT
+// license, Copyright (c) 2026 Sean Ciaschi): while the cutscene system plays something (a slot's byte
+// at D_800C35EA is 1), black bars are drawn over the widened picture beside the 4:3 frame, at the end
+// of the frame's display list: func_1501878C at 0x15018C8C, where $s1 points to the list's pointer and
+// the full sync goes next. The game marks no difference between a story scene and a hint, and the
+// player can't move in either, so the picture never changes shape while the player is in control.
+namespace {
+    constexpr uint32_t cutscene_playing = 0x800C35EA;  // D_800C35EA, a byte per slot
+    constexpr uint32_t frame_width_addr = 0x800BE620;  // D_800BE620 (292 in play)
+    constexpr uint32_t frame_height_addr = 0x800BE624; // D_800BE624 (216 in play)
+    constexpr int32_t bar_reach = 2048;  // past the margins
+    constexpr int32_t bar_overlap = 2;   // the game's cameras stop 2 pixels short of each side
+    // Our lists, in RDRAM past the game's 8 MB: a ring (the SPU and RSX are long done with a slot when
+    // it comes round again).
+    constexpr uint32_t bars_dl_start = 0x00F10000, bars_dl_slot = 0x80, bars_dl_slots = 32;
+    uint32_t bars_dl_next = 0;
+}
+
+extern "C" void conker_frame_dl_end(uint8_t* rdram, recomp_context* ctx) {
+    if (!g_settings.cutscenes_4x3 || n64gfx::g_wide_ratio <= 1.0f) return;
+    if (MEM_BU(0, (gpr)(int32_t)cutscene_playing) != 1 && MEM_BU(1, (gpr)(int32_t)cutscene_playing) != 1) return;
+    const int32_t width = MEM_W(0, (gpr)(int32_t)frame_width_addr), height = MEM_W(0, (gpr)(int32_t)frame_height_addr);
+    if (width <= 0 || height <= 0 || width > 1024 || height > 1024) return;
+    const uint32_t bars_dl = bars_dl_start + bars_dl_next * bars_dl_slot;
+    bars_dl_next = (bars_dl_next + 1) % bars_dl_slots;
+    gpr dl = (gpr)(int32_t)(0x80000000u | bars_dl);
+    put_command(rdram, dl, (rt64_hook_opcode << 24) | rt64_hook_magic, (rt64_hook_op_enable << 28) | rt64_extended_opcode);
+    put_command(rdram, dl, 0xE7000000, 0);                                                     // G_RDPPIPESYNC
+    put_command(rdram, dl, 0xED000000, ((uint32_t)(width * 4) << 12) | (uint32_t)(height * 4));  // scissor: the frame
+    put_command(rdram, dl, 0xE3000A01, 0x00300000);                                            // cycle type: fill
+    put_command(rdram, dl, 0xF7000000, 0);                                                     // fill color: black
+    put_fill(rdram, dl, -bar_reach, 0, bar_overlap, height);
+    put_fill(rdram, dl, width - bar_overlap, 0, width + bar_reach, height);
+    put_command(rdram, dl, 0xDF000000, 0);                                                     // G_ENDDL
+    // The call, where the game's full sync goes (which then follows it).
+    const gpr list_pointer = ctx->r17;
+    gpr game_dl = (gpr)(int32_t)MEM_W(0, list_pointer);
+    put_command(rdram, game_dl, 0xDE000000, bars_dl);  // G_DL: call, and come back
+    MEM_W(0, list_pointer) = (int32_t)game_dl;
+}

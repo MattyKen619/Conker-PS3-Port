@@ -1,0 +1,703 @@
+--- a/ultramodern/src/save_states.cpp
++++ b/ultramodern/src/save_states.cpp
+@@ -13,6 +13,8 @@
+ #if defined(_WIN32)
+ #   define WIN32_LEAN_AND_MEAN
+ #   include <Windows.h>
++#elif defined(__lv2ppu__)
++    // PS3: no backtrace or dynamic loader support.
+ #elif defined(__APPLE__)
+ #   include <execinfo.h>
+ #   include <mach-o/dyld.h>
+@@ -45,6 +47,11 @@
+         range.end = range.start + nt->OptionalHeader.SizeOfImage;
+         return range;
+     }
++#elif defined(__lv2ppu__)
++    // PS3: no loader API to find the program's range; save states are not supported yet.
++    ImageRange find_image_range() {
++        return ImageRange{};
++    }
+ #elif defined(__APPLE__)
+     ImageRange find_image_range() {
+         // Image 0 is the program. Its range is its segments' (but __PAGEZERO), moved by its slide.
+@@ -127,6 +134,8 @@
+             }
+             skip += count;
+         }
++#elif defined(__lv2ppu__)
++        // PS3: no backtrace(); every thread gets the same (empty) signature.
+ #else
+         void* frames[1024];
+         const int count = backtrace(frames, 1024);
+--- a/ultramodern/src/ultrainit.cpp
++++ b/ultramodern/src/ultrainit.cpp
+@@ -1,3 +1,4 @@
++#include <cstdio>
+ #include "ultramodern/ultra64.h"
+ #include "ultramodern/ultramodern.hpp"
+ 
+@@ -22,10 +23,19 @@
+ }
+ 
+ void ultramodern::preinit(RDRAM_ARG ultramodern::renderer::WindowHandle window_handle) {
++#if defined(__lv2ppu__)
++#  define UTRACE(x) std::printf("[trace] preinit: %s\n", x)
++#else
++#  define UTRACE(x) do {} while (0)
++#endif
+     ultramodern::set_entrypoint_thread();
++    UTRACE("events");
+     ultramodern::init_events(PASS_RDRAM window_handle);
++    UTRACE("timers");
+     ultramodern::init_timers(PASS_RDRAM1);
++    UTRACE("audio");
+     ultramodern::init_audio();
++    UTRACE("thread cleanup");
+     ultramodern::init_thread_cleanup();
+ }
+ 
+--- a/ultramodern/src/events.cpp
++++ b/ultramodern/src/events.cpp
+@@ -1,3 +1,4 @@
++#include <cstdio>
+ #include <thread>
+ #include <atomic>
+ #include <chrono>
+@@ -190,6 +191,9 @@
+ 
+ void vi_thread_func() {
+     ultramodern::set_native_thread_name("VI Thread");
++#if defined(__lv2ppu__)
++    std::printf("[trace] VI thread running\n");
++#endif
+     // This thread should be prioritized over every other thread in the application, as it's what allows
+     // the game to generate new audio and gfx lists.
+     ultramodern::set_native_thread_priority(ultramodern::ThreadPriority::Critical);
+@@ -276,6 +280,9 @@
+ 
+ void task_thread_func(uint8_t* rdram, moodycamel::LightweightSemaphore* thread_ready) {
+     ultramodern::set_native_thread_name("SP Task Thread");
++#if defined(__lv2ppu__)
++    std::printf("[trace] SP task thread running\n");
++#endif
+     ultramodern::set_native_thread_priority(ultramodern::ThreadPriority::Normal);
+ 
+     // Notify the caller thread that this thread is ready.
+@@ -338,11 +345,17 @@
+     using namespace std::chrono_literals;
+ 
+     ultramodern::set_native_thread_name("Gfx Thread");
++#if defined(__lv2ppu__)
++    std::printf("[trace] gfx thread running; creating renderer\n");
++#endif
+     ultramodern::set_native_thread_priority(ultramodern::ThreadPriority::Normal);
+ 
+     auto old_config = ultramodern::renderer::get_graphics_config();
+ 
+     auto renderer_context = ultramodern::renderer::create_render_context(rdram, window_handle, ultramodern::renderer::get_graphics_config().developer_mode);
++#if defined(__lv2ppu__)
++    std::printf("[trace] renderer created\n");
++#endif
+ 
+     renderer_chosen_api.store(renderer_context->get_chosen_api());
+     if (!renderer_context->valid()) {
+--- a/librecomp/src/recomp.cpp
++++ b/librecomp/src/recomp.cpp
+@@ -26,6 +26,13 @@
+ #include "librecomp/mods.hpp"
+ #include "recompiler/live_recompiler.h"
+ 
++// Bring-up tracing on the PS3: a line in the log at each startup step.
++#if defined(__lv2ppu__)
++#  define PS3_TRACE(...) do { std::printf("[trace] " __VA_ARGS__); std::printf("\n"); } while (0)
++#else
++#  define PS3_TRACE(...) do {} while (0)
++#endif
++
+ #ifdef _WIN32
+ #    define WIN32_LEAN_AND_MEAN
+ #    include <Windows.h>
+@@ -562,7 +569,9 @@
+     current_game_mode_id = game_mode_id;
+     current_game = game_id;
+     game_status.store(GameStatus::Running);
++#if !defined(__lv2ppu__) // no atomic wait/notify on PS3; the waiter polls
+     game_status.notify_all();
++#endif
+     mods::set_latest_game_mode_id(game_mode_id);
+ }
+ 
+@@ -577,7 +586,9 @@
+     exited.store(true);
+     GameStatus desired = GameStatus::None;
+     game_status.compare_exchange_strong(desired, GameStatus::Quit);
++#if !defined(__lv2ppu__) // no atomic wait/notify on PS3; the waiter polls
+     game_status.notify_all();
++#endif
+     std::lock_guard<std::mutex> lock(current_game_mutex);
+     current_game.reset();
+ }
+@@ -721,12 +732,19 @@
+ }
+ 
+ bool wait_for_game_started(uint8_t* rdram, recomp_context* context) {
++#if defined(__lv2ppu__)
++    while (game_status.load() == GameStatus::None) {
++        ultramodern::sleep_milliseconds(1);
++    }
++#else
+     game_status.wait(GameStatus::None);
++#endif
+ 
+     switch (game_status.load()) {
+         // TODO refactor this to allow a project to specify what entrypoint function to run for a give game.
+         case GameStatus::Running:
+             {
++                PS3_TRACE("game selected; loading stored ROM");
+                 if (!recomp::load_stored_rom(current_game.value())) {
+                     ultramodern::error_handling::message_box("Error opening stored ROM! Please restart this program.");
+                 }
+@@ -734,7 +752,9 @@
+                 auto find_it = game_roms.find(current_game.value());
+                 const recomp::GameEntry& game_entry = find_it->second;
+ 
++                PS3_TRACE("ROM loaded; initializing game memory");
+                 init(rdram, context, game_entry.entrypoint_address);
++                PS3_TRACE("game memory initialized; on_init");
+                 if (game_entry.on_init_callback) {
+                     game_entry.on_init_callback(rdram, context);
+                 }
+@@ -770,12 +790,14 @@
+                     }
+                 }
+ 
++                PS3_TRACE("mods loaded (%u bytes); heap", mod_ram_used);
+                 recomp::init_heap(rdram, recomp::mod_rdram_start + mod_ram_used);
+ 
+                 save_type = game_entry.save_type;
+                 ultramodern::init_saving(rdram);
+ 
+                 try {
++                    PS3_TRACE("calling the game entrypoint");
+                     game_entry.entrypoint(rdram, context);
+                 } catch (ultramodern::thread_terminated& terminated) {
+ 
+@@ -917,10 +939,12 @@
+ }
+ 
+ void recomp::start(const recomp::Configuration& cfg) {
++    PS3_TRACE("recomp::start");
+     project_version = cfg.project_version;
+ 
+     recomp::check_all_stored_roms();
+ 
++    PS3_TRACE("stored ROMs checked");
+     recomp::rsp::set_callbacks(cfg.rsp_callbacks);
+ 
+     static const ultramodern::rsp::callbacks_t ultramodern_rsp_callbacks {
+@@ -950,8 +974,11 @@
+ 
+     ultramodern::set_message_queue_control(cfg.message_queue_control);
+ 
++    PS3_TRACE("window ready; initializing mods");
+     recomp::mods::initialize_mods();
++    PS3_TRACE("scanning mods");
+     recomp::mods::scan_mods();
++    PS3_TRACE("mods scanned; allocating game memory");
+ 
+     // Allocate rdram without comitting it. Use a platform-specific virtual allocation function
+     // that initializes to zero. Protect the region above the memory size to catch accesses to invalid addresses.
+@@ -985,16 +1012,19 @@
+         return;
+     }
+ 
++    PS3_TRACE("game memory at %p (%u bytes)", (void*)rdram, (unsigned)allocation_size);
+     recomp::register_heap_exports();
+     recomp::mods::register_config_exports();
+     recomp::mods::register_hook_exports();
+ 
+     std::thread game_thread{[](ultramodern::renderer::WindowHandle window_handle, uint8_t* rdram) {
+         debug_printf("[Recomp] Starting\n");
++        PS3_TRACE("game start thread running");
+ 
+         ultramodern::set_native_thread_name("Game Start Thread");
+ 
+         ultramodern::preinit(rdram, window_handle);
++        PS3_TRACE("ultramodern preinit done; waiting for the game to start");
+ 
+         recomp_context context{};
+ 
+@@ -1002,7 +1032,9 @@
+         while (!wait_for_game_started(rdram, &context)) {}
+     }, window_handle, rdram};
+ 
++    PS3_TRACE("game start thread created; parsing options");
+     parse_cli(cfg.argc, cfg.argv);
++    PS3_TRACE("entering main loop");
+ 
+     while (!exited) {
+         ultramodern::sleep_milliseconds(1);
+--- a/librecomp/src/mods.cpp
++++ b/librecomp/src/mods.cpp
+@@ -74,6 +74,9 @@
+ // MSVC/GCC/Clang ARM64
+ #elif defined(__ARM_ARCH_ISA_A64)
+ #   define IS_ARM64
++// PS3 PPU: native function patching (mod hooks) is not supported.
++#elif defined(__powerpc64__)
++#   define IS_PPC64
+ #else
+ #   error "Unsupported architecture!"
+ #endif
+@@ -593,6 +596,9 @@
+            write_bytes(&native_func, sizeof(&native_func));
+         }
+     }, replacement_func);
++#elif defined(IS_PPC64)
++    (void)write_bytes;
++    ultramodern::error_handling::message_box("Mods that replace functions are not supported on PS3.");
+ #else
+ #   error "Unsupported architecture"
+ #endif
+--- a/librecomp/src/heap.cpp
++++ b/librecomp/src/heap.cpp
+@@ -35,7 +35,7 @@
+ 
+     // Calculate the offset of the heap from the start of rdram and the size of the heap.
+     heap_offset = address - 0x80000000U;
+-    size_t heap_size = recomp::mem_size - heap_offset;
++    size_t heap_size = recomp::heap_end - heap_offset;
+ 
+     printf("Initializing recomp heap at offset 0x%08X with size 0x%08X\n", heap_offset, static_cast<uint32_t>(heap_size));
+ 
+--- a/librecomp/src/sp.cpp
++++ b/librecomp/src/sp.cpp
+@@ -27,7 +27,11 @@
+         std::ofstream dump_file{ "ramdump" + std::string{ addr_str } + ".bin", std::ios::binary};
+ 
+         for (size_t i = 0; i < ram_size; i++) {
++#if defined(__BIG_ENDIAN__)
++            ram_unswapped[i] = rdram[i];
++#else
+             ram_unswapped[i] = rdram[i ^ 3];
++#endif
+         }
+ 
+         dump_file.write(ram_unswapped.get(), ram_size);
+--- a/librecomp/include/librecomp/addresses.hpp
++++ b/librecomp/include/librecomp/addresses.hpp
+@@ -6,10 +6,24 @@
+ #include "recomp.h"
+ 
+ namespace recomp {
++#if defined(__lv2ppu__)
++    // PS3: 256MB of main memory in total and no 4GB reservation, so addresses are masked to 26 bits
++    // (recomp.h, RECOMP_OFFSET) and one block holds everything:
++    //   0x0000000-0x07FFFFF  game RDRAM (8MB)
++    //   0x0800000-0x0BFFFFF  runtime PI handles and patch data
++    //   0x0C00000-0x0FFFFFF  recomp heap (used only by mods)
++    //   0x1000000-0x11FA12F  .game code segment (TLB-mapped at 0x15000000), read as data
++    //   0x2000000-0x2004D57  .debugger segment (TLB-mapped at 0x16000000)
++    constexpr size_t mem_size = 0x2010000ULL;
++    constexpr size_t allocation_size = mem_size;
++    constexpr size_t heap_end = 0x1000000ULL;
++#else
+     // 512GB (kseg0 size)
+     constexpr size_t mem_size = 512ULL * 1024ULL * 1024ULL;
+     // 4GB (the full address space)
+     constexpr size_t allocation_size = 4096ULL * 1024ULL * 1024ULL;
++    constexpr size_t heap_end = mem_size;
++#endif
+     // We need a place in rdram to hold the PI handles, so pick an address in extended rdram
+     constexpr int32_t cart_handle = 0x80800000;
+     constexpr int32_t drive_handle = (int32_t)(cart_handle + sizeof(OSPiHandle));
+@@ -17,7 +31,11 @@
+     constexpr int32_t flash_handle_end = (int32_t)(flash_handle + sizeof(OSPiHandle));
+     constexpr int32_t patch_rdram_start = 0x80801000;
+     static_assert(patch_rdram_start >= flash_handle_end);
++#if defined(__lv2ppu__)
++    constexpr int32_t mod_rdram_start = 0x80C00000;
++#else
+     constexpr int32_t mod_rdram_start = 0x81000000;
++#endif
+ 
+     // Flashram occupies the same physical address as sram, but that issue is avoided because libultra exposes
+     // a high-level interface for flashram. Because that high-level interface is reimplemented, low level accesses
+--- a/librecomp/include/librecomp/rsp.hpp
++++ b/librecomp/include/librecomp/rsp.hpp
+@@ -35,33 +35,44 @@
+ using RspUcodeFunc = RspExitReason(uint8_t* rdram, uint32_t ucode_addr);
+ 
+ extern uint8_t dmem[];
++
++// DMEM is stored like RDRAM: as native 32-bit words on little-endian hosts (so byte addresses are
++// XORed with 3), and exactly as on the N64 on big-endian hosts. RSP_HOST_BYTE(i, n) is the index
++// of the i-th most significant byte of an n-byte host integer.
++#if defined(__BIG_ENDIAN__) || (defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__)
++#define RSP_DMEM_BYTE_XOR 0
++#define RSP_HOST_BYTE(i, n) (i)
++#else
++#define RSP_DMEM_BYTE_XOR 3
++#define RSP_HOST_BYTE(i, n) ((n) - 1 - (i))
++#endif
+ extern uint16_t rspReciprocals[512];
+ extern uint16_t rspInverseSquareRoots[512];
+ 
+ #define RSP_MEM_B(offset, addr) \
+-    (*reinterpret_cast<int8_t*>(dmem + (0xFFF & (((offset) + (addr)) ^ 3))))
++    (*reinterpret_cast<int8_t*>(dmem + (0xFFF & (((offset) + (addr)) ^ RSP_DMEM_BYTE_XOR))))
+ 
+ #define RSP_MEM_BU(offset, addr) \
+-    (*reinterpret_cast<uint8_t*>(dmem + (0xFFF & (((offset) + (addr)) ^ 3))))
++    (*reinterpret_cast<uint8_t*>(dmem + (0xFFF & (((offset) + (addr)) ^ RSP_DMEM_BYTE_XOR))))
+ 
+ static inline uint32_t RSP_MEM_W_LOAD(uint32_t offset, uint32_t addr) {
+     uint32_t out;
+     for (int i = 0; i < 4; i++) {
+-        reinterpret_cast<uint8_t*>(&out)[i ^ 3] = RSP_MEM_BU(offset + i, addr);
++        reinterpret_cast<uint8_t*>(&out)[RSP_HOST_BYTE(i, 4)] = RSP_MEM_BU(offset + i, addr);
+     }
+     return out;
+ }
+ 
+ static inline void RSP_MEM_W_STORE(uint32_t offset, uint32_t addr, uint32_t val) {
+     for (int i = 0; i < 4; i++) {
+-        RSP_MEM_BU(offset + i, addr) = reinterpret_cast<uint8_t*>(&val)[i ^ 3];
++        RSP_MEM_BU(offset + i, addr) = reinterpret_cast<uint8_t*>(&val)[RSP_HOST_BYTE(i, 4)];
+     }
+ }
+ 
+ static inline uint32_t RSP_MEM_HU_LOAD(uint32_t offset, uint32_t addr) {
+     uint16_t out;
+     for (int i = 0; i < 2; i++) {
+-        reinterpret_cast<uint8_t*>(&out)[(i + 2) ^ 3] = RSP_MEM_BU(offset + i, addr);
++        reinterpret_cast<uint8_t*>(&out)[RSP_HOST_BYTE(i, 2)] = RSP_MEM_BU(offset + i, addr);
+     }
+     return out;
+ }
+@@ -69,14 +80,14 @@
+ static inline uint32_t RSP_MEM_H_LOAD(uint32_t offset, uint32_t addr) {
+     int16_t out;
+     for (int i = 0; i < 2; i++) {
+-        reinterpret_cast<uint8_t*>(&out)[(i + 2) ^ 3] = RSP_MEM_BU(offset + i, addr);
++        reinterpret_cast<uint8_t*>(&out)[RSP_HOST_BYTE(i, 2)] = RSP_MEM_BU(offset + i, addr);
+     }
+     return out;
+ }
+ 
+ static inline void RSP_MEM_H_STORE(uint32_t offset, uint32_t addr, uint32_t val) {
+     for (int i = 0; i < 2; i++) {
+-        RSP_MEM_BU(offset + i, addr) = reinterpret_cast<uint8_t*>(&val)[(i + 2) ^ 3];
++        RSP_MEM_BU(offset + i, addr) = reinterpret_cast<uint8_t*>(&val)[RSP_HOST_BYTE(i + 2, 4)];
+     }
+ }
+ 
+--- a/librecomp/include/librecomp/rsp_vu.hpp
++++ b/librecomp/include/librecomp/rsp_vu.hpp
+@@ -20,7 +20,9 @@
+ // ----------------------------------------------------------------------
+ #include <cstdint>
+ 
+-#if defined(__x86_64__) || defined(_M_X64)
++#if defined(RSP_FORCE_SISD)
++// Scalar code only (as on hosts without SSE4.1 or NEON, e.g. the PS3), for testing that path.
++#elif defined(__x86_64__) || defined(_M_X64)
+ #define ARCHITECTURE_SUPPORTS_SSE4_1 1
+ #include <nmmintrin.h>
+ using v128 = __m128i;
+@@ -62,6 +64,16 @@
+   return ((x & m) ^ b) - b;
+ }
+ 
++// Element i of a vector register is its i-th most significant 16 bits (byte i its i-th byte). The
++// register is held in host order: reversed on little-endian hosts, as is on big-endian ones.
++#if defined(__BIG_ENDIAN__) || (defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__)
++#define RSP_VU_BYTE(i) (i)
++#define RSP_VU_HALF(i) (i)
++#else
++#define RSP_VU_BYTE(i) (15 - (i))
++#define RSP_VU_HALF(i) (7 - (i))
++#endif
++
+ struct RSP {
+     using r32 = uint32_t;
+     using cr32 = const r32;
+@@ -75,20 +87,20 @@
+         auto operator=(__m128i value) { v128 = value; }
+ #endif
+ 
+-        auto byte(u32 index) -> uint8_t& { return ((uint8_t*)&u128)[15 - index]; }
+-        auto byte(u32 index) const -> uint8_t { return ((uint8_t*)&u128)[15 - index]; }
++        auto byte(u32 index) -> uint8_t& { return ((uint8_t*)&u128)[RSP_VU_BYTE(index)]; }
++        auto byte(u32 index) const -> uint8_t { return ((uint8_t*)&u128)[RSP_VU_BYTE(index)]; }
+ 
+-        auto element(u32 index) -> uint16_t& { return ((uint16_t*)&u128)[7 - index]; }
+-        auto element(u32 index) const -> uint16_t { return ((uint16_t*)&u128)[7 - index]; }
++        auto element(u32 index) -> uint16_t& { return ((uint16_t*)&u128)[RSP_VU_HALF(index)]; }
++        auto element(u32 index) const -> uint16_t { return ((uint16_t*)&u128)[RSP_VU_HALF(index)]; }
+ 
+-        auto u8(u32 index) -> uint8_t& { return ((uint8_t*)&u128)[15 - index]; }
+-        auto u8(u32 index) const -> uint8_t { return ((uint8_t*)&u128)[15 - index]; }
++        auto u8(u32 index) -> uint8_t& { return ((uint8_t*)&u128)[RSP_VU_BYTE(index)]; }
++        auto u8(u32 index) const -> uint8_t { return ((uint8_t*)&u128)[RSP_VU_BYTE(index)]; }
+ 
+-        auto s16(u32 index) -> int16_t& { return ((int16_t*)&u128)[7 - index]; }
+-        auto s16(u32 index) const -> int16_t { return ((int16_t*)&u128)[7 - index]; }
++        auto s16(u32 index) -> int16_t& { return ((int16_t*)&u128)[RSP_VU_HALF(index)]; }
++        auto s16(u32 index) const -> int16_t { return ((int16_t*)&u128)[RSP_VU_HALF(index)]; }
+ 
+-        auto u16(u32 index) -> uint16_t& { return ((uint16_t*)&u128)[7 - index]; }
+-        auto u16(u32 index) const -> uint16_t { return ((uint16_t*)&u128)[7 - index]; }
++        auto u16(u32 index) -> uint16_t& { return ((uint16_t*)&u128)[RSP_VU_HALF(index)]; }
++        auto u16(u32 index) const -> uint16_t { return ((uint16_t*)&u128)[RSP_VU_HALF(index)]; }
+ 
+         //VCx registers
+         auto get(u32 index) const -> bool { return u16(index) != 0; }
+--- a/ultramodern/include/ultramodern/renderer_context.hpp
++++ b/ultramodern/include/ultramodern/renderer_context.hpp
+@@ -56,6 +56,12 @@
+ // TODO add a native window handle option here (Display/Window for x11 and ANativeWindow for Android) as a compile-time option.
+ #elif defined(__linux__) || defined(__ANDROID__)
+         using WindowHandle = SDL_Window*;
++#elif defined(__lv2ppu__)
++        // PS3: there are no windows; the renderer owns the RSX display directly.
++        struct WindowHandle {
++            void* unused = nullptr;
++            auto operator<=>(const WindowHandle&) const = default;
++        };
+ #elif defined(__APPLE__)
+         struct WindowHandle {
+             void* window;
+--- a/ultramodern/include/ultramodern/ultra64.h
++++ b/ultramodern/include/ultramodern/ultra64.h
+@@ -1,6 +1,14 @@
+ #ifndef __ULTRA64_ultramodern_H__
+ #define __ULTRA64_ultramodern_H__
+ 
++// Big-endian hosts (PS3) store RDRAM exactly as the N64 does; little-endian hosts store it as
++// native 32-bit words, which reverses the order of sub-word struct members below.
++#if defined(__BIG_ENDIAN__) || (defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__)
++#define ULTRA64_BIG_ENDIAN_HOST 1
++#else
++#define ULTRA64_BIG_ENDIAN_HOST 0
++#endif
++
+ #include <stdint.h>
+ 
+ #ifdef __GNUC__
+@@ -39,7 +47,12 @@
+ #  define RDRAM_ARG1 uint8_t *rdram
+ #  define PASS_RDRAM rdram, 
+ #  define PASS_RDRAM1 rdram
+-#  define TO_PTR(type, var) ((type*)(&rdram[(uint64_t)var - 0xFFFFFFFF80000000]))
++#  if defined(__lv2ppu__)
++     // PS3: N64 addresses are masked to 26 bits (see RECOMP_OFFSET in recomp.h).
++#    define TO_PTR(type, var) ((type*)(&rdram[(uint32_t)(var) & 0x03FFFFFFu]))
++#  else
++#    define TO_PTR(type, var) ((type*)(&rdram[(uint64_t)var - 0xFFFFFFFF80000000]))
++#  endif
+ #  define GET_MEMBER(type, addr, member) (addr + (intptr_t)&(((type*)nullptr)->member))
+ #  ifdef __cplusplus
+ #    define NULLPTR (PTR(void))0
+@@ -99,8 +112,13 @@
+     OSPri priority;
+     PTR(PTR(struct OSThread_t)) queue; // Queue this thread is in, if any
+     uint32_t pad2;
++#if ULTRA64_BIG_ENDIAN_HOST
++    uint16_t state; // Big-endian host: RDRAM is stored as on the N64
++    uint16_t flags;
++#else
+     uint16_t flags; // These two are swapped to reflect rdram byteswapping
+     uint16_t state;
++#endif
+     OSId id;
+     int32_t pad3;
+     UltraThreadContext* context; // An actual pointer regardless of platform
+@@ -155,10 +173,16 @@
+ // PI
+ 
+ struct OSIoMesgHdr {
++#if ULTRA64_BIG_ENDIAN_HOST
++    u16 type;                  /* Message type */
++    u8 pri;                    /* Message priority (High or Normal) */
++    u8 status;                 /* Return status */
++#else
+     // These 3 reversed due to endianness
+     u8 status;                 /* Return status */
+     u8 pri;                    /* Message priority (High or Normal) */
+     u16 type;                  /* Message type */
++#endif
+     PTR(OSMesgQueue) retQueue; /* Return message queue to notify I/O completion */
+ };
+ 
+@@ -172,6 +196,15 @@
+ 
+ struct OSPiHandle {
+     PTR(OSPiHandle_s)    unused;        /* point to next handle on the table */
++#if ULTRA64_BIG_ENDIAN_HOST
++    u8                   type;          /* DEVICE_TYPE_BULK for disk */
++    u8                   latency;       /* domain latency */
++    u8                   pageSize;      /* domain page size */
++    u8                   relDuration;   /* domain release duration */
++    u8                   pulse;         /* domain pulse width */
++    u8                   domain;        /* which domain */
++    u16                  padding;       /* struct alignment padding */
++#else
+     // These four members reversed due to endianness
+     u8                   relDuration;   /* domain release duration */
+     u8                   pageSize;      /* domain page size */
+@@ -181,6 +214,7 @@
+     u16                  padding;       /* struct alignment padding */
+     u8                   domain;        /* which domain */
+     u8                   pulse;         /* domain pulse width */
++#endif
+     u32                  baseAddress;   /* Domain address */
+     u32                  speed;         /* for roms only */
+     /* The following are "private" elements" */
+@@ -208,8 +242,13 @@
+ } OSViFieldRegs;
+ 
+ typedef struct {
++#if ULTRA64_BIG_ENDIAN_HOST
++    u8 type;
++    u8 padding[3];
++#else
+     u8 padding[3];
+     u8 type;
++#endif
+     OSViCommonRegs comRegs;
+     OSViFieldRegs  fldRegs[2];
+ } OSViMode;
+@@ -229,20 +268,32 @@
+     int minode_table; /* mirrioring inode_table */
+     int dir_table; /* block location */
+     int inode_start_page; /* page # */
++#if ULTRA64_BIG_ENDIAN_HOST
++    u8 banks;
++    u8 activebank;
++    u8 padding[2];
++#else
+     // Padding and reversed members due to endianness
+     u8 padding[2];
+     u8 activebank;
+     u8 banks;
++#endif
+ } OSPfs;
+ 
+ 
+ // Controller
+ 
+ typedef struct {
++#if ULTRA64_BIG_ENDIAN_HOST
++    u16 type;                   /* Controller Type */
++    u8 status;                 /* Controller status */
++    u8 err_no;
++#else
+     // These three members reversed due to endianness
+     u8 err_no;
+     u8 status;                 /* Controller status */
+     u16 type;                   /* Controller Type */
++#endif
+ } OSContStatus;
+ 
+ typedef struct {
+--- a/thirdparty/concurrentqueue/lightweightsemaphore.h
++++ b/thirdparty/concurrentqueue/lightweightsemaphore.h
+@@ -22,6 +22,11 @@
+ 	__declspec(dllimport) unsigned long __stdcall WaitForSingleObject(void* hHandle, unsigned long dwMilliseconds);
+ 	__declspec(dllimport) int __stdcall ReleaseSemaphore(void* hSemaphore, long lReleaseCount, long* lpPreviousCount);
+ }
++#elif defined(__lv2ppu__)
++#include <sys/sem.h>
++// Profiler hook (ps3/host/perf.c): marks the calling thread as blocked while it waits.
++extern "C" void ps3prof_block(int blocked) __attribute__((weak));
++extern "C" void ps3prof_wait_error(const char* where, int code) __attribute__((weak));
+ #elif defined(__MACH__)
+ #include <mach/mach.h>
+ #elif defined(__unix__)
+@@ -104,6 +109,70 @@
+ 		while (!ReleaseSemaphore(m_hSema, count, nullptr));
+ 	}
+ };
++#elif defined(__lv2ppu__)
++//---------------------------------------------------------
++// Semaphore (PS3 lv2 kernel)
++//---------------------------------------------------------
++class Semaphore
++{
++private:
++	sys_sem_t m_sema;
++
++	Semaphore(const Semaphore& other) MOODYCAMEL_DELETE_FUNCTION;
++	Semaphore& operator=(const Semaphore& other) MOODYCAMEL_DELETE_FUNCTION;
++
++public:
++	Semaphore(int initialCount = 0)
++	{
++		assert(initialCount >= 0);
++		sys_sem_attr_t attr = {};
++		attr.attr_protocol = SYS_SEM_ATTR_PROTOCOL;
++		attr.attr_pshared = SYS_SEM_ATTR_PSHARED;
++		int rc = sysSemCreate(&m_sema, &attr, initialCount, 0x7FFFFFFF);
++		if (rc != 0 && ps3prof_wait_error) ps3prof_wait_error("sysSemCreate", rc);
++	}
++
++	~Semaphore()
++	{
++		sysSemDestroy(m_sema);
++	}
++
++	bool wait()
++	{
++		if (ps3prof_block) ps3prof_block(1);
++		int rc = sysSemWait(m_sema, 0);
++		if (ps3prof_block) ps3prof_block(0);
++		if (rc != 0 && ps3prof_wait_error) ps3prof_wait_error("sysSemWait", rc);
++		return rc == 0;
++	}
++
++	bool try_wait()
++	{
++		return sysSemTryWait(m_sema) == 0;
++	}
++
++	bool timed_wait(std::uint64_t usecs)
++	{
++		// lv2 treats a timeout of 0 as "wait forever".
++		if (usecs == 0) return try_wait();
++		if (ps3prof_block) ps3prof_block(1);
++		int rc = sysSemWait(m_sema, usecs);
++		if (ps3prof_block) ps3prof_block(0);
++		// 0x8001000B: ETIMEDOUT, the normal result of a timed wait.
++		if (rc != 0 && rc != (int)0x8001000B && ps3prof_wait_error) ps3prof_wait_error("sysSemWait(timed)", rc);
++		return rc == 0;
++	}
++
++	void signal()
++	{
++		sysSemPost(m_sema, 1);
++	}
++
++	void signal(int count)
++	{
++		if (count > 0) sysSemPost(m_sema, count);
++	}
++};
+ #elif defined(__MACH__)
+ //---------------------------------------------------------
+ // Semaphore (Apple iOS and OSX)
+@@ -346,7 +415,13 @@
+ 	}
+ 
+ public:
++#if defined(__lv2ppu__)
++	// PS3: the PPU has only 2 hardware threads, so spinning steals time from the thread that would
++	// signal the semaphore. Spin briefly, then block.
++	LightweightSemaphore(ssize_t initialCount = 0, int maxSpins = 64) : m_count(initialCount), m_maxSpins(maxSpins)
++#else
+ 	LightweightSemaphore(ssize_t initialCount = 0, int maxSpins = 10000) : m_count(initialCount), m_maxSpins(maxSpins)
++#endif
+ 	{
+ 		assert(initialCount >= 0);
+ 		assert(maxSpins >= 0);
