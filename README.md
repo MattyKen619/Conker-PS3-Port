@@ -91,8 +91,7 @@ updated. To remove everything, delete that folder as well.
 - One controller: the multiplayer modes can't be played with more than one player yet.
 - The 1080-line resolution and 60 frames a second (in-between frames) aren't in 1.0: they work, but not well
   enough yet. They are planned for 2.0.
-- Tested on Evilnat 4.92 CFW only. `ConkersBadFurDay_PS3_1.0_HEN.pkg` is the same game packaged for PS3HEN,
-  which hasn't been tried yet: reports are welcome.
+- Tested on Evilnat 4.92 CFW only. PS3HEN hasn't been tried.
 - Only the US ROM works.
 
 ## Reporting a problem
@@ -136,8 +135,7 @@ make -C app RELEASE=1 -j8 pkg
 
 `setup_upstream.sh` fetches CBFD-Recompiled at the commit this port is made from, applies this repository's
 PS3 patches to it and to N64Recomp and N64ModernRuntime, and recompiles your ROM's code into C in
-`upstream/` (never commit that folder: it is made from the game). The output is `app/conker_bfd.pkg`, and
-`app/conker_bfd.gnpdrm.pkg` for PS3HEN.
+`upstream/` (never commit that folder: it is made from the game). The output is `app/conker_bfd.pkg`.
 
 `make -C app pkg` without `RELEASE=1` builds the test version instead ("Conker PS3 (graphics test)", title ID
 `CNKR00005`): it keeps a log and its files in `/dev_hdd0/tmp/conkerps3/`, takes screenshots, has the 1080-line
