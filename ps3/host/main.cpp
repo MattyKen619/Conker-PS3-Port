@@ -103,7 +103,7 @@ namespace {
     constexpr const char* kTestName = "Conker PS3 profiler v5";
 #else
     constexpr int kRunSeconds = 0;  // no limit: until quit from the XMB
-    constexpr const char* kTestName = "Conker PS3 graphics test v59";
+    constexpr const char* kTestName = "Conker PS3 graphics test 1.1";
 #endif
 
     const std::u8string game_id = u8"conker.n64.us.1.0";
@@ -373,11 +373,11 @@ namespace {
 }
 #endif
 
-// Controller 0 is a plain controller with no pak; nothing else is connected (as in the PC
-// host's headless mode). Used by osContInit/osPfsInit.
+// The N64's four controller ports are PS3 controllers 1 to 4, each with a Rumble Pak (input.cpp drives
+// the PS3 controller's motor). The first is always there, as before; the others when their PS3
+// controller is on when the game looks (osContInit, osContGetQuery: e.g. entering the multiplayer menu).
 ultramodern::input::connected_device_info_t conker::get_connected_device_info(int controller_num) {
-    if (controller_num == 0) {
-        // A Rumble Pak, so the game turns on rumble (input.cpp drives the PS3 controller's motor).
+    if (controller_num == 0 || (controller_num > 0 && controller_num < 4 && ps3input::is_connected(controller_num))) {
         return { ultramodern::input::Device::Controller, ultramodern::input::Pak::RumblePak };
     }
     return { ultramodern::input::Device::None, ultramodern::input::Pak::None };

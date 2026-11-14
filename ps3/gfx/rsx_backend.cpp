@@ -393,9 +393,10 @@ void RsxBackend::clear_depth(uint32_t zimg_addr, float, float, float, float) {
 }
 
 // ------------------------------------------------------------------------------- state
-void RsxBackend::set_scissor(const Target* t, const DrawState& st) {
+void RsxBackend::set_scissor(const Target* t, const DrawState& st, bool view3d) {
     float sx0, sx1;
-    wide_scissor(st, t->width_n64, t->margin, &sx0, &sx1);
+    if (view3d) wide_scissor_3d(st, t->width_n64, t->margin, &sx0, &sx1);  // a split-screen view's sides widened
+    else wide_scissor_rect(st, t->width_n64, t->margin, views_, &sx0, &sx1);
     int x0 = std::max(0, (int)t->xoff + (int)(sx0 * scale_)), y0 = std::max(0, (int)(st.sc_uly * scale_));
     int x1 = std::min((int)t->w, (int)t->xoff + (int)(sx1 * scale_)), y1 = std::min((int)t->h, (int)(st.sc_lry * scale_));
     if (x1 < x0) x1 = x0;
@@ -406,9 +407,9 @@ void RsxBackend::set_scissor(const Target* t, const DrawState& st) {
     note("  scissor %d,%d %dx%d on %ux%u", x0, y0, x1 - x0, y1 - y0, t->w, t->h);
 }
 
-void RsxBackend::set_viewport(const Target* t, const float scale[3], const float trans[3], float widen_x) {
+void RsxBackend::set_viewport(const Target* t, const float scale[3], const float trans[3], float widen_x, float shift_x) {
     float s[4] = {scale[0] * scale_ * widen_x, -scale[1] * scale_, scale[2], 0};
-    float o[4] = {trans[0] * scale_ + (float)t->xoff, trans[1] * scale_, trans[2], 0};
+    float o[4] = {(trans[0] + shift_x) * scale_ + (float)t->xoff, trans[1] * scale_, trans[2], 0};
     const float key[8] = {s[0], s[1], s[2], 0, o[0], o[1], o[2], 0};
     if (cache_.vp_w == t->w && cache_.vp_h == t->h && std::memcmp(cache_.vp, key, sizeof key) == 0) return;
     std::memcpy(cache_.vp, key, sizeof key); cache_.vp_w = t->w; cache_.vp_h = t->h;
@@ -633,6 +634,7 @@ void RsxBackend::reset_state() {
 void RsxBackend::begin_dl() {
     reset_state();
     film_.next_list();
+    views_.next_list();
     // The other half of the scratch memory, once the RSX is done with the display list that used it.
     scratch_half_ ^= 1;
     scratch_pos_ = 0;
@@ -946,13 +948,14 @@ bool RsxBackend::setup_triangles(const DrawState& st, size_t count) {
          p ? "ok" : "FAILED", st.om_h, st.om_l);
     if (!p) return false;
     load_fp((rsxFragmentProgram*)p->blob.data(), p->offset);
-    set_scissor(t, st);
+    set_scissor(t, st, true);
+    if (wide_split_view(st, t->width_n64, t->margin)) views_.note(st);
     // Widescreen: 3D with a viewport covering the frame isn't clipped at the 4:3 edges. Its x is
     // divided by how much wider the picture is and the viewport widened as much, which puts every
     // point where it was but moves the clip planes out to the margins' edges.
     const bool widen = wide_viewport(st, t->width_n64, t->margin);
     const float wf = widen ? (float)(t->width_n64 + 2 * t->margin) / (float)t->width_n64 : 1.0f, inv_wf = 1.0f / wf;
-    set_viewport(t, st.vp_scale, st.vp_trans, wf);
+    set_viewport(t, st.vp_scale, st.vp_trans, wf, wide_view_shift(st, t->width_n64, t->margin));
     set_blend_depth(st, false, false);
     const bool bilinear = st.cycle() != CYC_COPY && ((st.om_h >> 12) & 3) >= 2;
     float uvs[2][2] = {{0, 0}, {0, 0}}, uvo[2][2] = {{0, 0}, {0, 0}};
@@ -1024,7 +1027,7 @@ void RsxBackend::rect(const DrawState& st, float ulx, float uly, float lrx, floa
     {
         // Widescreen: untextured rectangles reaching the scissor's sides reach into the margins.
         const uint32_t width = st.cimg_width ? st.cimg_width : 320;
-        wide_rect(st, width, wide_margin(width), textured, &ulx, &lrx);
+        wide_rect(st, width, wide_margin(width), textured, &ulx, &lrx, &views_);
     }
     if (lrx <= ulx || lry <= uly) return;
     struct ResetExt { uint32_t (&e)[2][2]; ~ResetExt() { std::memset(e, 0, sizeof e); } } reset_ext{fb_ext_};

@@ -4,11 +4,12 @@
 // queue_samples), at the game's rate (22020 Hz for Conker), and paces itself by how much is still
 // queued (osAiGetLength -> get_frames_remaining). Those samples go into a ring buffer. A
 // high-priority thread feeds the PS3 audio port: 2 channels of 32-bit float at a fixed 48 kHz, in
-// blocks of 256 frames, resampling with linear interpolation.
+// blocks of 256 frames, resampling with a windowed-sinc filter (fill_block).
 //
 // RDRAM is big-endian on the PS3, exactly as on the N64, so each stereo frame is [left, right] (the
 // PC build has to swap them).
 #include <atomic>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -42,22 +43,54 @@ namespace {
     std::atomic<uint32_t> underruns{0};
     std::atomic<uint64_t> frames_in{0};
 
+    // The resampler: a windowed-sinc filter (16 taps, 512 positions between two samples, Kaiser
+    // window), cut off at the game's own half rate. Linear interpolation, used up to 1.0, lets
+    // through mirror images of the sound above 11 kHz and dulls the top of what is there.
+    constexpr int kTaps = 16, kPhases = 512;
+    float sinc_table[kPhases][kTaps];
+    double bessel_i0(double x) {
+        double sum = 1.0, term = 1.0;
+        for (int k = 1; k < 32; k++) { term *= (x / (2.0 * k)) * (x / (2.0 * k)); sum += term; }
+        return sum;
+    }
+    void make_sinc_table() {
+        const double beta = 8.0, pi = 3.14159265358979323846;
+        for (int p = 0; p < kPhases; p++) {
+            const double frac = (double)p / kPhases;
+            double sum = 0.0, w[kTaps];
+            for (int t = 0; t < kTaps; t++) {
+                const double x = (double)(t - (kTaps / 2 - 1)) - frac;  // distance from the output point, in samples
+                const double r = x / (kTaps / 2);
+                const double win = r * r < 1.0 ? bessel_i0(beta * std::sqrt(1.0 - r * r)) / bessel_i0(beta) : 0.0;
+                const double sinc = std::fabs(x) < 1e-9 ? 1.0 : std::sin(pi * x) / (pi * x);
+                w[t] = sinc * win;
+                sum += w[t];
+            }
+            for (int t = 0; t < kTaps; t++) sinc_table[p][t] = (float)(w[t] / sum);  // unity gain
+        }
+    }
+
     void fill_block(float* out) {
         std::lock_guard lock{ring_mutex};
         const double step = (double)in_rate.load() / (double)kOutRate;
         for (int i = 0; i < AUDIO_BLOCK_SAMPLES; i++) {
             uint64_t i0 = (uint64_t)ring_read;
-            if (i0 + 1 >= ring_write) {
+            if (i0 + kTaps / 2 >= ring_write) {
                 // Underrun: play silence for the rest of the block.
                 for (; i < AUDIO_BLOCK_SAMPLES; i++) { out[i * 2] = 0.0f; out[i * 2 + 1] = 0.0f; }
                 underruns++;
                 return;
             }
-            float frac = (float)(ring_read - (double)i0);
-            const float* a = &ring[(i0 % kRingFrames) * 2];
-            const float* b = &ring[((i0 + 1) % kRingFrames) * 2];
-            out[i * 2 + 0] = a[0] + (b[0] - a[0]) * frac;
-            out[i * 2 + 1] = a[1] + (b[1] - a[1]) * frac;
+            const float* w = sinc_table[(int)((ring_read - (double)i0) * kPhases) & (kPhases - 1)];
+            float l = 0.0f, r = 0.0f;
+            const uint64_t first = i0 + kRingFrames - (kTaps / 2 - 1);  // (the ring starts as silence)
+            for (int t = 0; t < kTaps; t++) {
+                const float* a = &ring[((first + t) % kRingFrames) * 2];
+                l += a[0] * w[t];
+                r += a[1] * w[t];
+            }
+            out[i * 2 + 0] = l < -1.0f ? -1.0f : l > 1.0f ? 1.0f : l;
+            out[i * 2 + 1] = r < -1.0f ? -1.0f : r > 1.0f ? 1.0f : r;
             ring_read += step;
         }
     }
@@ -88,6 +121,7 @@ extern "C" void ps3prof_set_name(const char* name);
 void ps3prof_set_name_c(const char* name) { ps3prof_set_name(name); }
 
 bool ps3audio::init() {
+    make_sinc_table();
     s32 r = audioInit();
     audioPortParam params{};
     params.numChannels = AUDIO_PORT_2CH;

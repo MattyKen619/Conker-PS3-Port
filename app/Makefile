@@ -16,7 +16,7 @@ RT        := $(UP)/tools/N64ModernRuntime
 # ROM (stand-in in the package: tools/release/mark_icon.py; or release/ICON0.local.png if you made one,
 # not in the repository).
 # PROFILE=1: the profiler build (instrumented game code, separate app on the XMB).
-VERSION   := 1.0
+VERSION   := 1.1
 ifeq ($(RELEASE),1)
 TARGET    := conker_bfd
 BUILD     := build-release
@@ -86,6 +86,8 @@ CPPFILES := $(filter-out $(EXCLUDE),$(foreach dir,$(SOURCES),$(notdir $(wildcard
 export LD       := $(CXX)
 export OFILES   := spu_audio_o2.bin.o spu_gfx.bin.o $(CPPFILES:.cpp=.o) $(CFILES:.c=.o)
 export LIBPATHS := $(LIBPSL1GHT_LIB)
+# The build, by default (release-prep, defined above, would otherwise be the default goal).
+.DEFAULT_GOAL := $(BUILD)
 .PHONY: $(BUILD) clean pkg
 $(BUILD):
 	@[ -d $@ ] || mkdir -p $@

@@ -35,16 +35,78 @@ inline void wide_scissor(const DrawState& st, uint32_t width, uint32_t m, float*
     if (st.sc_lrx >= (float)width - kWideEdge) *x1 = (float)(width + m);
 }
 
-// Whether 3D drawn with the state's viewport is widened (the viewport covers the frame).
+// A split-screen view (multiplayer): a viewport that doesn't cover the frame, with the scissor around it
+// (2 players: the viewport 25..267 and the scissor 30..262 of 292; 4 players: quarters). As RT64 does
+// for the PC version, such a view is widened about the frame's middle: its sides move out by the
+// picture's ratio (one at the middle stays), and its centre with them, the projection kept.
+inline bool wide_split_view(const DrawState& st, uint32_t width, uint32_t m) {
+    if (!m || st.vp_scale[0] < (float)width * 0.15f) return false;
+    if (st.sc_ulx <= kWideEdge && st.sc_lrx >= (float)width - kWideEdge) return false;  // spans the frame
+    const float l = st.vp_trans[0] - st.vp_scale[0], r = st.vp_trans[0] + st.vp_scale[0];
+    return st.sc_ulx > l - 12.0f && st.sc_ulx < l + 12.0f && st.sc_lrx > r - 12.0f && st.sc_lrx < r + 12.0f;
+}
+// A split view's side (N64 x) where it's drawn in the widened picture.
+inline float wide_split_x(float x, uint32_t width, uint32_t m) {
+    const float half = (float)width * 0.5f;
+    if (x <= kWideEdge) return -(float)m;
+    if (x >= (float)width - kWideEdge) return (float)(width + m);
+    return half + (x - half) * (float)(width + 2 * m) / (float)width;
+}
+// How far a split view's centre moves (added to the viewport's x translation).
+inline float wide_view_shift(const DrawState& st, uint32_t width, uint32_t m) {
+    if (!wide_split_view(st, width, m)) return 0.0f;
+    return (st.vp_trans[0] - (float)width * 0.5f) * (float)(2 * m) / (float)width;
+}
+// The scissor for 3D (triangles): a split view's sides are widened.
+inline void wide_scissor_3d(const DrawState& st, uint32_t width, uint32_t m, float* x0, float* x1) {
+    if (wide_split_view(st, width, m)) { *x0 = wide_split_x(st.sc_ulx, width, m); *x1 = wide_split_x(st.sc_lrx, width, m); return; }
+    wide_scissor(st, width, m, x0, x1);
+}
+
+// Whether 3D drawn with the state's viewport is widened (the viewport covers the frame, or is a
+// split-screen view's).
 inline bool wide_viewport(const DrawState& st, uint32_t width, uint32_t m) {
     if (!m) return false;
     const float half = (float)width * 0.5f;
-    return st.vp_trans[0] > half - 4.0f && st.vp_trans[0] < half + 4.0f && st.vp_scale[0] > (float)width * 0.4f;
+    if (st.vp_trans[0] > half - 4.0f && st.vp_trans[0] < half + 4.0f && st.vp_scale[0] > (float)width * 0.4f) return true;
+    return wide_split_view(st, width, m);
+}
+
+// The split-screen views seen lately (their scissors, noted as their 3D is drawn): rectangles drawn in
+// one's scissor (the circle wipe's black and its quarters, the fade after it) are clipped to the view as
+// widened, and a plain one reaching the view's side reaches the widened side.
+struct SplitViews {
+    struct View { float x0 = 0, y0 = 0, x1 = 0, y1 = 0; uint32_t age = 1000; } v[8];
+    static constexpr uint32_t kHold = 90;  // display lists a view is remembered (its 3D may not be drawn while wiped out)
+    void next_list() { for (auto& e : v) if (e.age < 1000) e.age++; }
+    void note(const DrawState& st) {
+        View* oldest = &v[0];
+        for (auto& e : v) {
+            if (e.x0 == st.sc_ulx && e.x1 == st.sc_lrx && e.y0 == st.sc_uly && e.y1 == st.sc_lry) { e.age = 0; return; }
+            if (e.age > oldest->age) oldest = &e;
+        }
+        *oldest = View{st.sc_ulx, st.sc_uly, st.sc_lrx, st.sc_lry, 0};
+    }
+    bool has(const DrawState& st) const {
+        for (const auto& e : v)
+            if (e.age < kHold && e.x0 == st.sc_ulx && e.x1 == st.sc_lrx && e.y0 == st.sc_uly && e.y1 == st.sc_lry) return true;
+        return false;
+    }
+};
+// The scissor for rectangles: a split-screen view's is widened as its 3D's.
+inline void wide_scissor_rect(const DrawState& st, uint32_t width, uint32_t m, const SplitViews& views, float* x0, float* x1) {
+    if (m && views.has(st)) { *x0 = wide_split_x(st.sc_ulx, width, m); *x1 = wide_split_x(st.sc_lrx, width, m); return; }
+    wide_scissor(st, width, m, x0, x1);
 }
 
 // A rectangle's left and right sides in a widened image.
-inline void wide_rect(const DrawState& st, uint32_t width, uint32_t m, bool textured, float* ulx, float* lrx) {
+inline void wide_rect(const DrawState& st, uint32_t width, uint32_t m, bool textured, float* ulx, float* lrx, const SplitViews* views = nullptr) {
     if (!m || textured || st.rect_explicit) return;
+    if (views && views->has(st)) {  // in a split-screen view: out to its widened sides
+        if (*ulx <= st.sc_ulx + 0.5f) *ulx = wide_split_x(st.sc_ulx, width, m);
+        if (*lrx >= st.sc_lrx - 0.5f) *lrx = wide_split_x(st.sc_lrx, width, m);
+        return;
+    }
     if (st.sc_ulx <= kWideEdge && *ulx <= st.sc_ulx + 0.5f) *ulx = -(float)m;
     if (st.sc_lrx >= (float)width - kWideEdge && *lrx >= st.sc_lrx - 0.5f) *lrx = (float)(width + m);
 }

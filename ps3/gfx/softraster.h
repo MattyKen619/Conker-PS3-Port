@@ -22,7 +22,7 @@ public:
     };
 
     void draw_triangles(const DrawState& st, const OutVertex* v, size_t count) override;
-    void begin_dl() override { film_.next_list(); }
+    void begin_dl() override { film_.next_list(); views_.next_list(); }
     void fill_rect(const DrawState& st, float ulx, float uly, float lrx, float lry) override;
     void tex_rect(const DrawState& st, float ulx, float uly, float lrx, float lry,
                   float s, float t, float dsdx, float dtdy, bool flip) override;
@@ -41,6 +41,7 @@ public:
     bool traced_tris_ = false;
 
 private:
+    SplitViews views_;  // split-screen views, for rectangles drawn over them (widescreen.h)
     WideFilm film_;  // the old-film overlay spread across a widened picture (widescreen.h)
     // A copy of st whose frame textures (Texture::fb_addr) are real images cut from the color image.
     const DrawState& with_frame_textures(const DrawState& st);

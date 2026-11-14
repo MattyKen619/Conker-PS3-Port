@@ -16,6 +16,9 @@ namespace xmb_icon {
 #if defined(CONKER_RELEASE)
 namespace {
 constexpr const char* kIcon = CONKER_GAME_DIR "/ICON0.PNG";
+// A copy of the icon made, kept with the saves: installing a package (an update, or the same one again)
+// puts its stand-in back, and the copy goes back over it at the next start.
+constexpr const char* kKept = CONKER_DATA_DIR "/ICON0.PNG";
 constexpr uint32_t kW = 320, kH = 176;  // the XMB's icon size
 std::atomic<bool> g_wanted{false};
 
@@ -61,33 +64,53 @@ std::vector<uint8_t> fit(const std::vector<uint8_t>& src, uint32_t sw, uint32_t 
     return out;
 }
 
-// Writes the icon under a temporary name, then over the stand-in.
-bool save_icon(const std::vector<uint8_t>& rgba) {
-    size_t len = 0;
-    void* png = tdefl_write_image_to_png_file_in_memory_ex(rgba.data(), (int)kW, (int)kH, 4, &len, 6, MZ_FALSE);
-    if (!png) return false;
-    const std::string part = std::string(kIcon) + ".part";
+// Writes a file under a temporary name, then over the one there.
+bool write_file(const char* path, const void* data, size_t len) {
+    const std::string part = std::string(path) + ".part";
     FILE* f = std::fopen(part.c_str(), "wb");
-    bool ok = f && std::fwrite(png, 1, len, f) == len;
+    bool ok = f && std::fwrite(data, 1, len, f) == len;
     if (f) std::fclose(f);
-    mz_free(png);
     if (ok) {
-        if (std::rename(part.c_str(), kIcon) != 0) {
-            std::remove(kIcon);
-            ok = std::rename(part.c_str(), kIcon) == 0;
+        if (std::rename(part.c_str(), path) != 0) {
+            std::remove(path);
+            ok = std::rename(part.c_str(), path) == 0;
         }
     }
     std::remove(part.c_str());
     return ok;
+}
+
+// The icon over the stand-in, and its copy with the saves.
+bool save_icon(const std::vector<uint8_t>& rgba) {
+    size_t len = 0;
+    void* png = tdefl_write_image_to_png_file_in_memory_ex(rgba.data(), (int)kW, (int)kH, 4, &len, 6, MZ_FALSE);
+    if (!png) return false;
+    const bool ok = write_file(kIcon, png, len);
+    if (ok) write_file(kKept, png, len);
+    mz_free(png);
+    return ok;
+}
+
+bool marked(const std::vector<uint8_t>& data) {
+    const size_t n = sizeof(kMark) - 1;
+    for (size_t i = 0; i + n <= data.size(); i++)
+        if (data[i] == 'c' && std::memcmp(&data[i], kMark, n) == 0) return true;
+    return false;
 }
 }  // namespace
 
 void prepare() {
     std::vector<uint8_t> data;
     if (!read_file(kIcon, data)) return;  // not installed as a package
-    const size_t n = sizeof(kMark) - 1;
-    for (size_t i = 0; i + n <= data.size(); i++)
-        if (data[i] == 'c' && std::memcmp(&data[i], kMark, n) == 0) { g_wanted = true; return; }
+    if (!marked(data)) return;            // the icon made, or the builder's own
+    // The stand-in: the icon made before (kept with the saves) goes back at once; else it's made from
+    // the title screen.
+    std::vector<uint8_t> kept;
+    static const uint8_t kPng[8] = {0x89, 'P', 'N', 'G', '\r', '\n', 0x1A, '\n'};
+    if (read_file(kKept, kept) && kept.size() > 8 && std::memcmp(kept.data(), kPng, 8) == 0 && !marked(kept) &&
+        write_file(kIcon, kept.data(), kept.size()))
+        return;
+    g_wanted = true;
 }
 
 bool wanted() { return g_wanted.load(std::memory_order_relaxed); }

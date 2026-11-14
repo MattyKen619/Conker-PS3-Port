@@ -1,5 +1,6 @@
 // input.cpp - PS3 controller -> N64 controller.
 //
+// PS3 controllers 1 to 4 are the N64's four controller ports (the multiplayer modes).
 //   Left stick      analog stick          D-pad          D-pad
 //   Cross           A                     Circle         B
 //   L2 or R2        Z                     R1             R
@@ -26,11 +27,16 @@ namespace {
     constexpr uint16_t L_TRIG = 0x0020, R_TRIG = 0x0010;
     constexpr uint16_t U_CBUTTONS = 0x0008, D_CBUTTONS = 0x0004, L_CBUTTONS = 0x0002, R_CBUTTONS = 0x0001;
 
-    std::atomic<uint16_t> cur_buttons{0};
-    std::atomic<float> cur_x{0.0f}, cur_y{0.0f};
-    std::atomic<bool> connected{false};
+    // The four N64 controller ports: PS3 controllers 1 to 4.
+    constexpr int kPorts = 4;
+    std::atomic<uint16_t> cur_buttons_[kPorts];
+    std::atomic<float> cur_x_[kPorts], cur_y_[kPorts];
+    std::atomic<bool> connected_[kPorts];
+    std::atomic<uint16_t>& cur_buttons = cur_buttons_[0];
+    std::atomic<float> &cur_x = cur_x_[0], &cur_y = cur_y_[0];
+    std::atomic<bool>& connected = connected_[0];
     uint16_t seen_buttons = 0;  // for logging each button the first time it is pressed
-    bool rumble_on = false;
+    bool rumble_on[kPorts] = {false, false, false, false};
     std::atomic<uint32_t> select_presses{0}, l3_presses{0}, r3_presses{0}, polls{0}, changes{0};
     bool select_down = false, l3_down = false, r3_down = false;
 
@@ -70,60 +76,73 @@ namespace {
     }
 }
 
+namespace {
+    // One PS3 controller's state as an N64 controller's.
+    void read_pad(const padData& pad, uint16_t* buttons, float* sx, float* sy) {
+        uint16_t b = 0;
+        if (pad.BTN_CROSS) b |= A_BUTTON;
+        if (pad.BTN_CIRCLE) b |= B_BUTTON;
+        if (pad.BTN_L2 || pad.BTN_R2) b |= Z_TRIG;
+        if (pad.BTN_START) b |= START_BUTTON;
+        if (pad.BTN_UP) b |= U_JPAD;
+        if (pad.BTN_DOWN) b |= D_JPAD;
+        if (pad.BTN_LEFT) b |= L_JPAD;
+        if (pad.BTN_RIGHT) b |= R_JPAD;
+        if (pad.BTN_L1) b |= L_TRIG;
+        if (pad.BTN_R1) b |= R_TRIG;
+        if (pad.BTN_TRIANGLE) b |= U_CBUTTONS;
+        if (pad.BTN_SQUARE) b |= R_CBUTTONS;
+        // Right stick as C buttons, past half way.
+        float rx = axis(pad.ANA_R_H, false), ry = axis(pad.ANA_R_V, true);
+        if (ry > 0.5f) b |= U_CBUTTONS;
+        if (ry < -0.5f) b |= D_CBUTTONS;
+        if (rx < -0.5f) b |= L_CBUTTONS;
+        if (rx > 0.5f) b |= R_CBUTTONS;
+        float x = axis(pad.ANA_L_H, false), y = axis(pad.ANA_L_V, true);
+        // Small dead zone: PS3 sticks rest a few steps off center.
+        if (std::fabs(x) < 0.08f) x = 0.0f;
+        if (std::fabs(y) < 0.08f) y = 0.0f;
+        *buttons = b; *sx = x; *sy = y;
+    }
+}
+
 void ps3input::poll() {
     polls++;
     read_index++;
     struct Log { ~Log() { log_input(cur_buttons.load(), cur_x.load(), cur_y.load()); } } log_after;
     padInfo info;
-    if (ioPadGetInfo(&info) != 0 || !info.status[0]) {
-        connected = false;
+    if (ioPadGetInfo(&info) != 0) {
+        for (int i = 0; i < kPorts; i++) connected_[i] = false;
         return;
     }
-    connected = true;
-    padData pad;
-    if (ioPadGetData(0, &pad) != 0 || pad.len == 0) {
-        return;  // no change since the last read
+    for (int i = 0; i < kPorts; i++) {
+        connected_[i] = info.status[i] != 0;
+        if (!info.status[i]) continue;
+        padData pad;
+        if (ioPadGetData(i, &pad) != 0 || pad.len == 0) continue;  // no change since the last read
+        if (i == 0) {  // the first controller's extra buttons
+            if (pad.BTN_SELECT && !select_down) select_presses++;
+            select_down = pad.BTN_SELECT;
+            if (pad.BTN_L3 && !l3_down) l3_presses++;
+            l3_down = pad.BTN_L3;
+            if (pad.BTN_R3 && !r3_down) r3_presses++;
+            r3_down = pad.BTN_R3;
+        }
+        uint16_t b;
+        float x, y;
+        read_pad(pad, &b, &x, &y);
+        if (i == 0) {
+            uint16_t newly = b & ~seen_buttons;
+            if (newly) {
+                seen_buttons |= newly;
+                ps3_log("[input] first press of N64 button bits 0x%04X\n", newly);
+            }
+            changes++;
+        }
+        cur_buttons_[i] = b;
+        cur_x_[i] = x;
+        cur_y_[i] = y;
     }
-    if (pad.BTN_SELECT && !select_down) select_presses++;
-    select_down = pad.BTN_SELECT;
-    if (pad.BTN_L3 && !l3_down) l3_presses++;
-    l3_down = pad.BTN_L3;
-    if (pad.BTN_R3 && !r3_down) r3_presses++;
-    r3_down = pad.BTN_R3;
-    uint16_t b = 0;
-    if (pad.BTN_CROSS) b |= A_BUTTON;
-    if (pad.BTN_CIRCLE) b |= B_BUTTON;
-    if (pad.BTN_L2 || pad.BTN_R2) b |= Z_TRIG;
-    if (pad.BTN_START) b |= START_BUTTON;
-    if (pad.BTN_UP) b |= U_JPAD;
-    if (pad.BTN_DOWN) b |= D_JPAD;
-    if (pad.BTN_LEFT) b |= L_JPAD;
-    if (pad.BTN_RIGHT) b |= R_JPAD;
-    if (pad.BTN_L1) b |= L_TRIG;
-    if (pad.BTN_R1) b |= R_TRIG;
-    if (pad.BTN_TRIANGLE) b |= U_CBUTTONS;
-    if (pad.BTN_SQUARE) b |= R_CBUTTONS;
-    // Right stick as C buttons, past half way.
-    float rx = axis(pad.ANA_R_H, false), ry = axis(pad.ANA_R_V, true);
-    if (ry > 0.5f) b |= U_CBUTTONS;
-    if (ry < -0.5f) b |= D_CBUTTONS;
-    if (rx < -0.5f) b |= L_CBUTTONS;
-    if (rx > 0.5f) b |= R_CBUTTONS;
-
-    float x = axis(pad.ANA_L_H, false), y = axis(pad.ANA_L_V, true);
-    // Small dead zone: PS3 sticks rest a few steps off center.
-    if (std::fabs(x) < 0.08f) x = 0.0f;
-    if (std::fabs(y) < 0.08f) y = 0.0f;
-
-    uint16_t newly = b & ~seen_buttons;
-    if (newly) {
-        seen_buttons |= newly;
-        ps3_log("[input] first press of N64 button bits 0x%04X\n", newly);
-    }
-    changes++;
-    cur_buttons = b;
-    cur_x = x;
-    cur_y = y;
 }
 
 void ps3input::report() {
@@ -136,18 +155,24 @@ uint32_t ps3input::l3_count() { return l3_presses.load(); }
 uint32_t ps3input::r3_count() { return r3_presses.load(); }
 
 bool ps3input::get(int controller, uint16_t* buttons, float* x, float* y) {
-    if (controller != 0 || !connected) return false;
-    *buttons = cur_buttons.load();
-    *x = cur_x.load();
-    *y = cur_y.load();
+    if (controller < 0 || controller >= kPorts || !connected_[controller]) return false;
+    *buttons = cur_buttons_[controller].load();
+    *x = cur_x_[controller].load();
+    *y = cur_y_[controller].load();
     return true;
 }
 
+bool ps3input::is_connected(int controller) {
+    if (controller < 0 || controller >= kPorts) return false;
+    padInfo info;
+    return ioPadGetInfo(&info) == 0 && info.status[controller] != 0;
+}
+
 void ps3input::set_rumble(int controller, bool on) {
-    if (controller != 0 || on == rumble_on) return;
-    rumble_on = on;
+    if (controller < 0 || controller >= kPorts || on == rumble_on[controller]) return;
+    rumble_on[controller] = on;
     padActParam act{};
     act.small_motor = 0;
     act.large_motor = on ? 200 : 0;
-    ioPadSetActDirect(0, &act);
+    ioPadSetActDirect(controller, &act);
 }

@@ -131,6 +131,7 @@ public:
     void use_rsx_vertex_memory();
 
 private:
+    SplitViews views_;  // split-screen views, for rectangles drawn over them (widescreen.h)
     WideFilm film_;
     struct LogoTile { int x, y; std::vector<uint8_t> rgba; };
     std::vector<LogoTile> logo_now_, logo_last_;  // this list's logo tiles, and the last full logo's
@@ -228,8 +229,8 @@ private:
     // own, or an in-between frame's array of 4 floats).
     void draw(uint32_t offset, uint32_t count, u8 location, uint32_t pos_offset, u8 pos_stride);
     void draw(uint32_t offset, uint32_t count) { draw(offset, count, ring_location_, offset, sizeof(Vertex)); }
-    void set_scissor(const Target* t, const DrawState& st);
-    void set_viewport(const Target* t, const float scale[3], const float trans[3], float widen_x = 1.0f);
+    void set_scissor(const Target* t, const DrawState& st, bool view3d = false);
+    void set_viewport(const Target* t, const float scale[3], const float trans[3], float widen_x = 1.0f, float shift_x = 0.0f);
     void rect(const DrawState& st, float ulx, float uly, float lrx, float lry, bool textured,
               float s, float t, float dsdx, float dtdy, bool flip, bool fill);
     void wait_label(uint32_t index, uint32_t value);

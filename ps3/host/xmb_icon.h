@@ -3,6 +3,8 @@
 // start, prepare() sees the mark; then, the first time the title screen's logo is on the screen, the
 // renderer reads the picture, cuts the logo out, scales it to the XMB's 320 x 176 and saves it over the
 // stand-in (ICON0.PNG in the program's folder). The repository and the package hold no game artwork.
+// A copy is kept with the saves (/dev_hdd0/data/conker/ICON0.PNG): installing a package again (an update)
+// brings the stand-in back, and prepare() puts the copy over it at the next start.
 // A package built with release/ICON0.local.png carries that icon instead, with no mark: kept as it is.
 #pragma once
 #include <cstdint>

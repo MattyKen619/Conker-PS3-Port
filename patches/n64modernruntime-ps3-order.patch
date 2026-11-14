@@ -1,0 +1,48 @@
+--- a/ultramodern/src/events.cpp
++++ b/ultramodern/src/events.cpp
+@@ -8,6 +8,7 @@
+ #include <utility>
+ #include <mutex>
+ #include <queue>
++#include <deque>
+ #include <cstring>
+ 
+ #include "blockingconcurrentqueue.h"
+@@ -43,6 +44,28 @@
+ 
+ using Action = std::variant<SpTaskAction, ScreenUpdateAction, UpdateConfigAction, DummyWorkloadAction>;
+ 
++// The graphics thread's actions, strictly in the order they were sent, whichever thread sent them.
++// (moodycamel's queue keeps the order only within each sending thread: a display list the game sent
++// just before a VI's screen update could be done after it, or the other way round, and the screen then
++// showed a frame drawn after that VI: pictures out of order, a step back and forth (PS3 port, 1.1).)
++struct OrderedActionQueue {
++    std::mutex m;
++    std::deque<Action> q;
++    moodycamel::LightweightSemaphore items;
++    void enqueue(Action a) {
++        { std::lock_guard<std::mutex> lock{m}; q.push_back(std::move(a)); }
++        items.signal();
++    }
++    template <class Rep, class Period>
++    bool wait_dequeue_timed(Action& out, std::chrono::duration<Rep, Period> timeout) {
++        if (!items.wait((std::int64_t)std::chrono::duration_cast<std::chrono::microseconds>(timeout).count())) return false;
++        std::lock_guard<std::mutex> lock{m};
++        out = std::move(q.front());
++        q.pop_front();
++        return true;
++    }
++};
++
+ struct ViState {
+     const OSViMode* mode = nullptr;
+     PTR(void) framebuffer;
+@@ -139,7 +162,7 @@
+     // The same message queue may be used for multiple events, so share a mutex for all of them
+     std::mutex message_mutex;
+     uint8_t* rdram;
+-    moodycamel::BlockingConcurrentQueue<Action> action_queue{};
++    OrderedActionQueue action_queue{};
+     moodycamel::BlockingConcurrentQueue<OSTask*> sp_task_queue{};
+     moodycamel::ConcurrentQueue<OSThread*> deleted_threads{};
+ } events_context{};

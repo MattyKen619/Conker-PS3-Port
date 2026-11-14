@@ -7,6 +7,7 @@ namespace ps3input {
     void poll();
     bool get(int controller, uint16_t* buttons, float* x, float* y);
     void set_rumble(int controller, bool on);
+    bool is_connected(int controller);  // a PS3 controller is on that port (1 to 4) right now
     // Presses so far of the buttons the game doesn't use (Select: resolution, L3: frame rate).
     uint32_t select_count();
     uint32_t l3_count();

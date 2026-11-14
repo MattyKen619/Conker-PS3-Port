@@ -30,6 +30,7 @@ git checkout -q -- . && git clean -qfd
 git apply ../../recomp/n64modernruntime.patch
 git apply "$ROOT/patches/n64modernruntime-ps3.patch"
 git apply "$ROOT/patches/n64modernruntime-ps3-saves.patch"
+git apply "$ROOT/patches/n64modernruntime-ps3-order.patch"
 # The runtime carries its own copy of N64Recomp's recomp.h: patch it the same way.
 git -C N64Recomp checkout -q -- include/recomp.h
 git -C N64Recomp apply "$ROOT/patches/n64recomp-ps3.patch"

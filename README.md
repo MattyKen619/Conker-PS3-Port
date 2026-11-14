@@ -12,16 +12,34 @@ here, the PS3's Cell. What the game expected from the N64 is rebuilt on the PS3'
 - the controller (with rumble), the saves and the timing of the N64's operating system.
 
 It runs on a PS3 with custom firmware (tested on Evilnat 4.92), at a steady 30 frames a second like the
-original, with full sound. The whole game has been played through on a real console.
+original, with full sound and the multiplayer modes for up to four players. The whole game has been played
+through on a real console.
 
 You need your own copy of the game: no game data (graphics, sound, levels or text) is included in this
 repository or in the package. Everything the game shows and plays is read from your own ROM.
 
 ---
 
+> **Updating from 1.0?** Install 1.1 over it: your saves, settings and copy of the ROM are kept. Installing
+> brings back the package's plain icon on the XMB: to get the Conker logo back, start the game and let the
+> intro play until the title screen once, then quit. (From 1.1 on the game keeps a copy of the logo, and
+> puts it back by itself the next time a newer version is installed and started.)
+
+## What's new in 1.1
+
+- **Smoother picture**: the frames now always reach the screen in the order they were drawn. In 1.0 one
+  was sometimes shown before the frame that came before it, a small step back and forth that made movement
+  and camera turns stutter, though the game itself ran at full speed.
+- **Multiplayer**: up to four PS3 controllers, each with rumble; split screen in widescreen (with the
+  circle wipe and fades across the whole screen); and the crash back to the XMB when starting a
+  multiplayer game is fixed.
+- **Higher-quality sound**: the game's audio is resampled to the PS3's output with a windowed-sinc filter
+  (clearer high notes, less aliasing).
+- **XMB icon**: kept through updates (see above).
+
 ## Download and install
 
-1. Download `ConkersBadFurDay_PS3_1.0.pkg` from the [Releases page](https://github.com/MattyKen619/Conker-PS3-Port/releases).
+1. Download `ConkersBadFurDay_PS3_1.1.pkg` from the [Releases page](https://github.com/MattyKen619/Conker-PS3-Port/releases).
 2. Copy it to the PS3 (a USB drive, or FTP to `/dev_hdd0/packages/`) and install it from the XMB:
    **Package Manager > Install Package Files**. It appears as "Conker's Bad Fur Day" (title ID `CNKR00001`).
 3. Put your ROM where the game can find it (see below) and start the game.
@@ -56,6 +74,10 @@ replaces it with the title screen's own "Conker's Bad Fur Day" logo, taken from 
 once you have quit the game. Every player's icon comes from their own copy of the game, and the repository
 holds no artwork.
 
+Installing the package again (an update) brings the stand-in back. The game keeps a copy of the icon it
+made with the saves (`/dev_hdd0/data/conker/ICON0.PNG`) and puts it back as soon as it starts. Updating from
+1.0, which kept no copy, the icon is made again the first time the title screen is shown.
+
 To use your own pictures instead, put them in `release/` before building: `ICON0.local.png` (a 320 x 176
 icon) and `PIC1.local.png` (a 1920 x 1080 background for the XMB). The package uses whichever of these files
 exist. They are ignored by git: keep publishers' artwork out of the repository.
@@ -75,22 +97,22 @@ exist. They are ignored by git: keep publishers' artwork out of the repository.
 | R1 | R |
 | D-pad | D-pad |
 | Start | Start |
-| Select | Change the resolution |
+| Select | Change the resolution (controller 1) |
 
-Rumble works (the game sees a Rumble Pak). To quit, press the PS button and choose Quit Game. Quitting
+Controllers 1 to 4 are the N64's four ports, for the multiplayer modes: turn the extra controllers on
+before choosing multiplayer. Rumble works on every controller (the game sees a Rumble Pak). To quit, press the PS button and choose Quit Game. Quitting
 doesn't save: the game saves at its own save points, as on the N64.
 
 ## Saves
 
-The game's save (the N64 cartridge's EEPROM), the settings and the copy of your ROM are kept in
+The game's save (the N64 cartridge's EEPROM), the settings, the copy of your ROM and the XMB icon's copy are kept in
 `/dev_hdd0/data/conker/`, outside the game's folder: they stay when the game is deleted from the XMB or
 updated. To remove everything, delete that folder as well.
 
 ## Known issues
 
-- One controller: the multiplayer modes can't be played with more than one player yet.
-- The 1080-line resolution and 60 frames a second (in-between frames) aren't in 1.0: they work, but not well
-  enough yet. They are planned for 2.0.
+- The 1080-line resolution and 60 frames a second (in-between frames) aren't in this version: they work,
+  but not well enough yet. They are planned for 2.0.
 - Tested on Evilnat 4.92 CFW only. PS3HEN hasn't been tried.
 - Only the US ROM works.
 
@@ -111,8 +133,6 @@ file only exists after something has gone wrong.
 - **Anti-aliasing** (smoothed edges) at 648 and 864 lines.
 - **Picture options**: a choice between the N64's own look (dither, its output blur, its texture filtering)
   and a clean, sharp picture.
-- **Higher-quality sound**: better resampling of the game's audio to the PS3's output.
-- **Multiplayer**: four PS3 controllers in the multiplayer modes, and split screen in widescreen.
 
 ## Building
 
@@ -155,7 +175,7 @@ which the development tools replay on a computer.
 - `ps3/spu/audio/`: the N64's audio microcode (recompiled by RSPRecomp) running on an SPU.
 - `ps3/compat/`, `ps3/include/`: what the runtime needs from a C/C++ library that PSL1GHT doesn't have.
 - `patches/`: the changes to CBFD-Recompiled, N64Recomp and N64ModernRuntime for the PS3 (big-endian memory,
-  threads, saves).
+  threads, saves, and the graphics thread's work kept in the order it was sent).
 - `game/`, `runtime/`, `app/`: the builds of the recompiled game code, the runtime and the program.
 
 ## Credits

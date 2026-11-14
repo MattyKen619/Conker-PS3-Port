@@ -477,9 +477,13 @@ extern "C" void conker_iris_end(uint8_t* rdram, recomp_context* ctx) {
     int32_t left = camera_bound(rdram, iris_camera, camera_left);
     int32_t right = camera_bound(rdram, iris_camera, camera_right);
     int32_t cx = cx4 / 4, cy = cy4 / 4, r = r4 / 4;
-    // A full-screen camera is clipped to 2..290; split-screen ones stop in the middle.
-    int32_t wide_left = left <= 4 ? left - wide_reach : left;
-    int32_t wide_right = right >= 286 ? right + wide_reach : right;
+    // A full-screen camera is clipped to 2..290, and its sides reach past the frame's edges. A split-screen
+    // view's sides are where the renderer widens them (about the frame's middle, widescreen.h
+    // wide_split_view; a side at the middle, the quarters', stays), as the PC version's 1f624df.
+    const int32_t frame_width = MEM_W(0, (gpr)(int32_t)0x800BE620);  // D_800BE620
+    const float middle = (float)frame_width * 0.5f, ratio = widescreen_ratio();
+    int32_t wide_left = left <= 4 ? left - wide_reach : (int32_t)std::floor(middle + ((float)left - middle) * ratio);
+    int32_t wide_right = right >= frame_width - 6 ? right + wide_reach : (int32_t)std::ceil(middle + ((float)right - middle) * ratio);
     int32_t band_top = std::max(top, cy - r);
     int32_t band_bottom = std::min(bottom, cy + r);
     put_fill(rdram, dl, wide_left, top, wide_right, band_top);
@@ -660,7 +664,10 @@ namespace {
     uint32_t list_commands(uint8_t* rdram) {
         const uint32_t game = game_list_commands(rdram);
         const uint32_t budget = game > display_list_room ? game - display_list_room : 0;
-        return game + std::max<uint32_t>(budget / 2, 1000);
+        // At most 4000 (the PC version's fix 3e38563): the multiplayer arenas' budgets are far larger
+        // (14400 to 26400 commands) and their heap tighter; half again ran it out in Tank and Heist
+        // (the allocator's halt, a syscall at 0x150AD770; seen on v60 entering multiplayer).
+        return game + std::clamp<uint32_t>(budget / 2, 1000, 4000);
     }
 }
 

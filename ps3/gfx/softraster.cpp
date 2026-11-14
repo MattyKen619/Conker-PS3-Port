@@ -283,7 +283,9 @@ void SoftRaster::draw_triangles(const DrawState& st_in, const OutVertex* v, size
     const bool use_z = st.z_buffered();
     std::vector<float>* z = use_z ? &depth(st, t) : nullptr;
     float wx0, wx1;
-    wide_scissor(st, t.width, t.margin, &wx0, &wx1);
+    wide_scissor_3d(st, t.width, t.margin, &wx0, &wx1);
+    if (wide_split_view(st, t.width, t.margin)) views_.note(st);
+    const float view_shift = wide_view_shift(st, t.width, t.margin);  // a split-screen view's centre
     const float sx0 = std::max(-(float)t.margin, wx0), sy0 = std::max(0.0f, st.sc_uly);
     const float sx1 = std::min((float)(t.width + t.margin), wx1), sy1 = std::min((float)t.height, st.sc_lry);
 
@@ -332,7 +334,7 @@ void SoftRaster::draw_triangles(const DrawState& st_in, const OutVertex* v, size
         for (int k = 0; k < n; k++) {
             const FV& p = poly[k];
             float iw = 1.0f / p.w;
-            sv[k].x = st.vp_trans[0] + p.x * iw * st.vp_scale[0];
+            sv[k].x = st.vp_trans[0] + view_shift + p.x * iw * st.vp_scale[0];
             sv[k].y = st.vp_trans[1] - p.y * iw * st.vp_scale[1];
             sv[k].z = st.vp_trans[2] + p.z * iw * st.vp_scale[2];
             sv[k].iw = iw; sv[k].sw = p.s * iw; sv[k].tw = p.t * iw;
@@ -392,9 +394,9 @@ static void trace_state(const char* what, const DrawState& st, float ulx, float 
 void SoftRaster::fill_rect(const DrawState& st, float ulx, float uly, float lrx, float lry) {
     if (trace) trace_state("fill", st, ulx, uly, lrx, lry);
     Target& t = target(st);
-    wide_rect(st, t.width, t.margin, false, &ulx, &lrx);
+    wide_rect(st, t.width, t.margin, false, &ulx, &lrx, &views_);
     float wx0, wx1;
-    wide_scissor(st, t.width, t.margin, &wx0, &wx1);
+    wide_scissor_rect(st, t.width, t.margin, views_, &wx0, &wx1);
     int x0 = (int)std::floor(std::max({-(float)t.margin, ulx, wx0})), y0 = (int)std::max({0.0f, uly, st.sc_uly});
     int x1 = (int)std::min({(float)(t.width + t.margin), lrx, wx1}), y1 = (int)std::min({(float)t.height, lry, st.sc_lry});
     if (st.cycle() == CYC_FILL) {
@@ -423,7 +425,7 @@ void SoftRaster::tex_rect(const DrawState& st_in, float ulx, float uly, float lr
     Target& t = target(st);
     if (film_.note(st, ulx, uly, lrx, lry) || bullet_hole(st)) wide_film(t.width, t.margin, &ulx, &lrx);
     float wx0, wx1;
-    wide_scissor(st, t.width, t.margin, &wx0, &wx1);
+    wide_scissor_rect(st, t.width, t.margin, views_, &wx0, &wx1);
     int x0 = (int)std::floor(std::max({-(float)t.margin, ulx, wx0})), y0 = (int)std::max({0.0f, uly, st.sc_uly});
     int x1 = (int)std::min({(float)(t.width + t.margin), lrx, wx1}), y1 = (int)std::min({(float)t.height, lry, st.sc_lry});
     float shade[4] = {0, 0, 0, 0};
