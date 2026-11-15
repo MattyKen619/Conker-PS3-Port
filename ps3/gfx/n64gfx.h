@@ -340,12 +340,16 @@ public:
     void end_frame();  // forgets textures not used for a while (calls on_evict for each first)
     void touch(const Texture* t) override;  // marks an image as used this frame
     size_t size() const { return entries_.size(); }
+    size_t bytes() const { return bytes_; }
+    uint32_t capped = 0;  // images dropped for the cap (kMaxBytes)
+    static constexpr size_t kMaxBytes = 12u << 20;
     std::function<void(Texture&)> on_evict;  // backends free their copy of the image here
     uint32_t decoded = 0;
 private:
     struct Entry { Texture tex; std::vector<uint8_t> pixels; uint32_t last_used; };
     std::unordered_map<uint64_t, Entry*> entries_;
     uint32_t frame_ = 0;
+    size_t bytes_ = 0;
 };
 #endif
 

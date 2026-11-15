@@ -16,7 +16,7 @@ RT        := $(UP)/tools/N64ModernRuntime
 # ROM (stand-in in the package: tools/release/mark_icon.py; or release/ICON0.local.png if you made one,
 # not in the repository).
 # PROFILE=1: the profiler build (instrumented game code, separate app on the XMB).
-VERSION   := 1.1
+VERSION   := 1.2
 ifeq ($(RELEASE),1)
 TARGET    := conker_bfd
 BUILD     := build-release

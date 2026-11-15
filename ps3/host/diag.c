@@ -6,6 +6,8 @@
 //
 // Crashes: tries to install an lv2 PPU exception handler (liblv2dbg). Where the firmware allows it, a
 // crash writes the faulting address, the registers and a call chain to the log before exiting.
+#include <malloc.h>
+#include <ppu-lv2.h>
 #include <errno.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -95,10 +97,22 @@ _ssize_t __librt_write_r(struct _reent* r, int fd, const void* ptr, size_t len) 
     return (_ssize_t)done;
 }
 
+// The memory free (the system's, for this program) and the C library's heap (1.2: the crash report says
+// how much was left).
+LV2_SYSCALL user_memory(u32* info) { lv2syscall1(352, (u64)(uintptr_t)info); return_to_user_prog(s32); }
+void ps3_log_memory(void) {
+    u32 info[2] = {0, 0};  // total, available
+    const s32 rc = user_memory(info);
+    const struct mallinfo m = mallinfo();
+    ps3_log("[ps3] memory: %u KB free of %u KB (rc %d); the heap has %u KB in use, %u KB free in %u KB taken from the system\n",
+            info[1] / 1024, info[0] / 1024, (int)rc, (unsigned)(m.uordblks / 1024), (unsigned)(m.fordblks / 1024), (unsigned)(m.arena / 1024));
+}
+
 // abort() (also reached from failed assert()s and std::terminate): say so before exiting.
 void abort(void) {
     ps3_crash_begin();
     ps3_log("\n[ps3] abort() called: the program stopped itself (failed check or unhandled error).\n");
+    ps3_log_memory();
     sysProcessExit(134);
     for (;;) {}
 }

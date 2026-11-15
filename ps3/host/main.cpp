@@ -103,7 +103,7 @@ namespace {
     constexpr const char* kTestName = "Conker PS3 profiler v5";
 #else
     constexpr int kRunSeconds = 0;  // no limit: until quit from the XMB
-    constexpr const char* kTestName = "Conker PS3 graphics test 1.1";
+    constexpr const char* kTestName = "Conker PS3 graphics test 1.2";
 #endif
 
     const std::u8string game_id = u8"conker.n64.us.1.0";

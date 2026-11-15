@@ -32,6 +32,8 @@ std::atomic<bool> g_renderer_owns_display{false};
 extern std::atomic<bool> g_conker_motion_blur;  // widescreen_hooks.cpp
 extern "C" void ps3prof_block(int blocked) __attribute__((weak));
 
+extern "C" void ps3_log_memory(void);  // diag.c
+
 namespace {
 constexpr const char* kShotDir = CONKER_DATA_DIR;  // the test builds' screenshots and R3 captures
 
@@ -412,6 +414,9 @@ private:
                     bs.draws, bs.programs, bs.program_failures, bs.textures_uploaded, (unsigned long)interp_.textures().size(),
                     bs.targets, bs.segment_waits, bs.vram_used_kb / 1024, bs.vram_mb, bs.alloc_failures, bs.cmd_wraps, backend_.last_error.empty() ? "" : "; error: ",
                     backend_.last_error.c_str());
+        std::printf("[gfx]   texture cache: %lu images, %.1f MB (at most %u MB), %u dropped for the cap (total)\n", (unsigned long)interp_.textures().size(),
+                    interp_.textures().bytes() / 1048576.0, (unsigned)(n64gfx::TextureCache::kMaxBytes >> 20), interp_.textures().capped);
+        ps3_log_memory();
         report_screen_timing();
         // Where the graphics thread's time went (ms per display list, this interval).
         {

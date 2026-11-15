@@ -280,9 +280,27 @@ uint64_t tile_hash(const uint8_t* tmem, const Tile& tile, uint32_t tlut_type) {
     hash_range(start, len);
     if (tile.siz == 3) hash_range(start + 0x800, len);
     if (uses_palette(tile, tlut_type)) {
-        // The palette entries this tile can use: 16 for 4-bit texels (its palette number picks them).
-        if (tile.siz == 0) hsh.add(tmem + 0x800 + ((tile.palette & 15) << 7), 128);
-        else hsh.add(tmem + 0x800, 0x800);
+        // The palette entries this tile can use, their colours only (v74): an entry is 8 bytes of TMEM
+        // here (0x800 + i * 8) but only its first 2 are the colour (tlut_color); the other 6 hold
+        // whatever was there, and hashing them gave the same picture new hashes: decoded and uploaded
+        // again, its pack picture asked for again (1.1's crash in It's War: main memory ran out).
+        // 4-bit texels: the 16 entries of the tile's palette number; 8-bit: entries 0 up to the
+        // highest index the texels use.
+        uint32_t first = 0, count = 16;
+        if (tile.siz == 0) first = (tile.palette & 15) << 4;
+        else {
+            uint32_t top = 0;
+            for (uint32_t i = 0; i < len; i++) { const uint32_t b = tmem[(start + i) & 0xFFF]; top = b > top ? b : top; }
+            count = top + 1;
+        }
+        alignas(16) uint8_t colours[512];
+        for (uint32_t i = 0; i < count; i++) {
+            const uint32_t at = (0x800 + (first + i) * 8) & 0xFFE;
+            colours[2 * i] = tmem[at]; colours[2 * i + 1] = tmem[at + 1];
+        }
+        uint32_t n = count * 2;
+        while (n & 7) colours[n++] = 0;
+        hsh.add(colours, n);
     }
     return hsh.result();
 }
@@ -357,6 +375,7 @@ const Texture* TextureCache::get_hashed(uint64_t hsh, const uint8_t* tmem, const
     Entry* e = new Entry();
     decoded++;
     e->pixels.resize((size_t)w * h * 4);
+    bytes_ += e->pixels.size();
     e->last_used = frame_;
     decode_tile(tmem, tile, tlut_type, e->pixels.data());
     Texture& t = e->tex;
@@ -375,11 +394,30 @@ void TextureCache::end_frame() {
     frame_++;
     for (auto it = entries_.begin(); it != entries_.end();) {
         if (frame_ - it->second->last_used > 120) {
+            bytes_ -= it->second->pixels.size();
             if (on_evict) on_evict(it->second->tex);
             delete it->second;
             it = entries_.erase(it);
         } else {
             ++it;
+        }
+    }
+    // A cap on the decoded images (1.2): past kMaxBytes, those unused longest go first, but none used in
+    // the last 64 display lists (the SPU sends a texture again once it's gone unused for 60, so it never
+    // counts on one dropped here). A scene drawing many textures once each (It's War's battle) kept
+    // thousands for 120 lists and main memory ran out (1.1: std::bad_alloc).
+    if (bytes_ > kMaxBytes) {
+        std::vector<std::pair<uint32_t, uint64_t>> old;
+        for (const auto& [h, e] : entries_) if (frame_ - e->last_used > 64) old.push_back({e->last_used, h});
+        std::sort(old.begin(), old.end());
+        for (const auto& [used, h] : old) {
+            if (bytes_ <= kMaxBytes * 3 / 4) break;
+            auto it = entries_.find(h);
+            bytes_ -= it->second->pixels.size();
+            if (on_evict) on_evict(it->second->tex);
+            delete it->second;
+            entries_.erase(it);
+            capped++;
         }
     }
 }

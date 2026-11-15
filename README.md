@@ -20,10 +20,20 @@ repository or in the package. Everything the game shows and plays is read from y
 
 ---
 
-> **Updating from 1.0?** Install 1.1 over it: your saves, settings and copy of the ROM are kept. Installing
-> brings back the package's plain icon on the XMB: to get the Conker logo back, start the game and let the
-> intro play until the title screen once, then quit. (From 1.1 on the game keeps a copy of the logo, and
-> puts it back by itself the next time a newer version is installed and started.)
+> **Updating?** Install 1.2 over 1.0 or 1.1: your saves, settings and copy of the ROM are kept. Installing
+> brings back the package's plain icon on the XMB. From 1.1, the game puts the Conker logo back by itself:
+> start it once (the settings screen is enough), then quit. From 1.0, start the game and let the intro play
+> until the title screen once, then quit.
+
+## What's new in 1.2
+
+- **Fixed: the crash in It's War**: the game stopped (back to the XMB, "abort() called" in the crash
+  report) during the battle, around when the General knocks Conker out, and again on loading the save
+  there. The port recognised some of the game's textures as new every frame (it compared parts of the
+  N64's texture memory the picture doesn't use), decoded them again and again, and main memory ran out.
+  Textures are now told apart by what they show, and the decoded ones are kept within a fixed amount of
+  memory.
+- **More useful crash reports**: `crash_report.txt` now names the error and says how much memory was free.
 
 ## What's new in 1.1
 
@@ -39,7 +49,7 @@ repository or in the package. Everything the game shows and plays is read from y
 
 ## Download and install
 
-1. Download `ConkersBadFurDay_PS3_1.1.pkg` from the [Releases page](https://github.com/MattyKen619/Conker-PS3-Port/releases).
+1. Download `ConkersBadFurDay_PS3_1.2.pkg` from the [Releases page](https://github.com/MattyKen619/Conker-PS3-Port/releases).
 2. Copy it to the PS3 (a USB drive, or FTP to `/dev_hdd0/packages/`) and install it from the XMB:
    **Package Manager > Install Package Files**. It appears as "Conker's Bad Fur Day" (title ID `CNKR00001`).
 3. Put your ROM where the game can find it (see below) and start the game.

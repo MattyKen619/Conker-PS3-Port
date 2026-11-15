@@ -30,6 +30,8 @@
 extern "C" void ps3prof_block(int blocked) __attribute__((weak));
 extern "C" void ps3prof_wait_error(const char* where, int code) __attribute__((weak));
 extern "C" void ps3prof_thread_exit(void) __attribute__((weak));
+extern "C" void ps3_crash_begin(void) __attribute__((weak));
+extern "C" void ps3_log(const char* fmt, ...) __attribute__((weak));
 
 namespace ps3compat {
 
@@ -207,10 +209,15 @@ private:
         try {
             (*fn)();
         } catch (const std::exception& e) {
-            std::fprintf(stderr, "\n[ps3compat] unhandled exception in a thread: %s\n", e.what());
+            // Into the log, or the release's crash report (1.2: it said only "abort() called").
+            if (ps3_crash_begin) ps3_crash_begin();
+            if (ps3_log) ps3_log("\n[ps3compat] unhandled exception in a thread: %s\n", e.what());
+            else std::fprintf(stderr, "\n[ps3compat] unhandled exception in a thread: %s\n", e.what());
             std::abort();
         } catch (...) {
-            std::fprintf(stderr, "\n[ps3compat] unhandled non-standard exception in a thread\n");
+            if (ps3_crash_begin) ps3_crash_begin();
+            if (ps3_log) ps3_log("\n[ps3compat] unhandled non-standard exception in a thread\n");
+            else std::fprintf(stderr, "\n[ps3compat] unhandled non-standard exception in a thread\n");
             std::abort();
         }
         fn.reset();
