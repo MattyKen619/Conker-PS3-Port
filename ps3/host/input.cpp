@@ -2,12 +2,12 @@
 //
 // PS3 controllers 1 to 4 are the N64's four controller ports (the multiplayer modes).
 //   Left stick      analog stick          D-pad          D-pad
-//   Cross           A                     Circle         B
+//   Cross           A                     Circle         B (or C-right: the menu's "B button" Square)
 //   L2 or R2        Z                     R1             R
 //   L1              L                     Start          Start
 //   Right stick     C buttons (up/down/left/right)
-//   Triangle        C-up      Square      C-right   (extra, for quick access)
-//   Select          next picture resolution (the renderer's, not the game's)
+//   Triangle        C-up      Square      C-right   (extra, for quick access; or B: settings.h b_on_square)
+//   Select + Start  held for a second: quit to the XMB (2.0; Select stepped through the resolutions before)
 //   L3 (left stick pressed)   60 / 30 frames a second
 //   R3 (right stick pressed)  saves the game memory of the next 3 frames (snapshot_*.png, for checking)
 #include <atomic>
@@ -15,8 +15,10 @@
 #include <cstdint>
 #include <cstdio>
 #include <io/pad.h>
+#include <sys/systime.h>
 
 #include "input.h"
+#include "settings.h"
 
 extern "C" void ps3_log(const char* fmt, ...);
 
@@ -32,13 +34,20 @@ namespace {
     std::atomic<uint16_t> cur_buttons_[kPorts];
     std::atomic<float> cur_x_[kPorts], cur_y_[kPorts];
     std::atomic<bool> connected_[kPorts];
+    // Each controller's buttons without the right stick's C-buttons, and its right stick (x right, y down, -1 to 1):
+    // the right stick is the C-buttons unless the free camera turns with it (free_camera.cpp).
+    uint16_t base_buttons_[kPorts];
+    std::atomic<float> right_x_[kPorts], right_y_[kPorts];
     std::atomic<uint16_t>& cur_buttons = cur_buttons_[0];
     std::atomic<float> &cur_x = cur_x_[0], &cur_y = cur_y_[0];
     std::atomic<bool>& connected = connected_[0];
     uint16_t seen_buttons = 0;  // for logging each button the first time it is pressed
     bool rumble_on[kPorts] = {false, false, false, false};
     std::atomic<uint32_t> select_presses{0}, l3_presses{0}, r3_presses{0}, polls{0}, changes{0};
-    bool select_down = false, l3_down = false, r3_down = false;
+    bool select_down = false, start_down = false, l3_down = false, r3_down = false;
+    // Select + Start held on the first controller: since when (timebase), and whether a second has passed.
+    uint64_t combo_since = 0;
+    std::atomic<bool> quit_combo{false};
 
     float axis(unsigned v, bool invert) {
         float f = ((float)v - 128.0f) / 127.0f;
@@ -78,10 +87,11 @@ namespace {
 
 namespace {
     // One PS3 controller's state as an N64 controller's.
-    void read_pad(const padData& pad, uint16_t* buttons, float* sx, float* sy) {
+    void read_pad(const padData& pad, uint16_t* buttons, float* sx, float* sy, float* rsx, float* rsy) {
         uint16_t b = 0;
         if (pad.BTN_CROSS) b |= A_BUTTON;
-        if (pad.BTN_CIRCLE) b |= B_BUTTON;
+        const bool b_square = g_settings.b_on_square;  // the menu's "B button": Square (Circle then C-right)
+        if (b_square ? pad.BTN_SQUARE : pad.BTN_CIRCLE) b |= B_BUTTON;
         if (pad.BTN_L2 || pad.BTN_R2) b |= Z_TRIG;
         if (pad.BTN_START) b |= START_BUTTON;
         if (pad.BTN_UP) b |= U_JPAD;
@@ -91,13 +101,10 @@ namespace {
         if (pad.BTN_L1) b |= L_TRIG;
         if (pad.BTN_R1) b |= R_TRIG;
         if (pad.BTN_TRIANGLE) b |= U_CBUTTONS;
-        if (pad.BTN_SQUARE) b |= R_CBUTTONS;
-        // Right stick as C buttons, past half way.
-        float rx = axis(pad.ANA_R_H, false), ry = axis(pad.ANA_R_V, true);
-        if (ry > 0.5f) b |= U_CBUTTONS;
-        if (ry < -0.5f) b |= D_CBUTTONS;
-        if (rx < -0.5f) b |= L_CBUTTONS;
-        if (rx > 0.5f) b |= R_CBUTTONS;
+        if (b_square ? pad.BTN_CIRCLE : pad.BTN_SQUARE) b |= R_CBUTTONS;
+        // The right stick: the C-buttons (stick_buttons) or the free camera.
+        *rsx = axis(pad.ANA_R_H, false);
+        *rsy = axis(pad.ANA_R_V, false);
         float x = axis(pad.ANA_L_H, false), y = axis(pad.ANA_L_V, true);
         // Small dead zone: PS3 sticks rest a few steps off center.
         if (std::fabs(x) < 0.08f) x = 0.0f;
@@ -106,8 +113,23 @@ namespace {
     }
 }
 
+namespace {
+    std::atomic<uint64_t> last_read{0};
+    // The right stick as C buttons, past half way (y down).
+    uint16_t stick_buttons(float rx, float ry) {
+        uint16_t b = 0;
+        if (ry < -0.5f) b |= U_CBUTTONS;
+        if (ry > 0.5f) b |= D_CBUTTONS;
+        if (rx < -0.5f) b |= L_CBUTTONS;
+        if (rx > 0.5f) b |= R_CBUTTONS;
+        return b;
+    }
+}
+uint64_t ps3input::last_read_tb() { return last_read.load(); }
+
 void ps3input::poll() {
     polls++;
+    last_read = __builtin_ppc_get_timebase();
     read_index++;
     struct Log { ~Log() { log_input(cur_buttons.load(), cur_x.load(), cur_y.load()); } } log_after;
     padInfo info;
@@ -123,14 +145,20 @@ void ps3input::poll() {
         if (i == 0) {  // the first controller's extra buttons
             if (pad.BTN_SELECT && !select_down) select_presses++;
             select_down = pad.BTN_SELECT;
+            start_down = pad.BTN_START;
             if (pad.BTN_L3 && !l3_down) l3_presses++;
             l3_down = pad.BTN_L3;
             if (pad.BTN_R3 && !r3_down) r3_presses++;
             r3_down = pad.BTN_R3;
         }
         uint16_t b;
-        float x, y;
-        read_pad(pad, &b, &x, &y);
+        float x, y, rx, ry;
+        read_pad(pad, &b, &x, &y, &rx, &ry);
+        base_buttons_[i] = b;
+        right_x_[i] = rx;
+        right_y_[i] = ry;
+        // The right stick is the C-buttons, unless this player's free camera turns with it now.
+        if (!free_camera_owns_stick(i)) b |= stick_buttons(rx, ry);
         if (i == 0) {
             uint16_t newly = b & ~seen_buttons;
             if (newly) {
@@ -143,7 +171,27 @@ void ps3input::poll() {
         cur_x_[i] = x;
         cur_y_[i] = y;
     }
+    // A controller unchanged since its last read (no data): the free camera may have taken or let go of its stick since.
+    for (int i = 0; i < kPorts; i++) {
+        if (!connected_[i]) continue;
+        uint16_t b = base_buttons_[i];
+        if (!free_camera_owns_stick(i)) b |= stick_buttons(right_x_[i].load(), right_y_[i].load());
+        cur_buttons_[i] = b;
+    }
+    // Select + Start: quit once both have been held for a second (a quick press of both does nothing more
+    // than Start does: the game's pause). Read here, as the game reads the controllers: it does every frame,
+    // in its pause menu too.
+    if (connected_[0] && select_down && start_down) {
+        const uint64_t now = __builtin_ppc_get_timebase();
+        if (!combo_since) combo_since = now;
+        else if (now - combo_since >= sysGetTimebaseFrequency() && !quit_combo.exchange(true))
+            ps3_log("[input] Select + Start held for a second: quitting\n");
+    } else {
+        combo_since = 0;
+    }
 }
+
+bool ps3input::quit_combo_held() { return quit_combo.load(); }
 
 void ps3input::report() {
     ps3_log("[input] last 10 s: the game read the controller %u times, %u changes; controller %s\n", polls.exchange(0), changes.exchange(0),
@@ -159,6 +207,13 @@ bool ps3input::get(int controller, uint16_t* buttons, float* x, float* y) {
     *buttons = cur_buttons_[controller].load();
     *x = cur_x_[controller].load();
     *y = cur_y_[controller].load();
+    return true;
+}
+
+bool ps3input::right_stick(int controller, float* x, float* y) {
+    if (controller < 0 || controller >= kPorts || !connected_[controller]) return false;
+    *x = right_x_[controller].load();
+    *y = right_y_[controller].load();
     return true;
 }
 

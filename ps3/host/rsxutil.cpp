@@ -68,6 +68,16 @@ static void waitRSXIdle()
 	waitFinish();
 }
 
+static u32 sEyeOffset = 0;  // 3D: where the eye being drawn starts in the display buffer
+
+// 3D: draw into the right eye's lines (eye 1) or the left eye's (0) of display buffer `index`.
+void setRenderTargetEye(u32 index,int eye)
+{
+	sEyeOffset = (stereo_on && eye) ? 750*color_pitch : 0;
+	setRenderTarget(index);
+	sEyeOffset = 0;
+}
+
 void setRenderTarget(u32 index)
 {
 	gcmSurface sf;
@@ -75,7 +85,7 @@ void setRenderTarget(u32 index)
 	sf.colorFormat		= GCM_SURFACE_X8R8G8B8;
 	sf.colorTarget		= GCM_SURFACE_TARGET_0;
 	sf.colorLocation[0]	= GCM_LOCATION_RSX;
-	sf.colorOffset[0]	= color_offset[index];
+	sf.colorOffset[0]	= color_offset[index] + sEyeOffset;
 	sf.colorPitch[0]	= color_pitch;
 
 	sf.colorLocation[1]	= GCM_LOCATION_RSX;
@@ -103,6 +113,14 @@ void setRenderTarget(u32 index)
 
 	rsxSetSurface(context,&sf);
 }
+
+// Stereoscopic 3D (2.0): HDMI 720p frame packing (0x81), a 1280 x 1470 picture: the left eye's 720 lines,
+// 30 blank ones, the right eye's 720. Everything draws the left eye's lines as a 1280 x 720 display (so
+// display_width / display_height stay one eye's); the renderer draws the right eye's too (3D step 1:
+// the same picture; later each eye draws its own).
+int stereo_on = 0;
+static u32 flat_mode, flat_width, flat_height, flat_pitch;
+static u32 flat_buffer_bytes;
 
 void *host_mem = NULL;
 u32 host_mem_size = 0;
@@ -138,6 +156,9 @@ void init_screen(void *host_addr,u32 size)
 	display_aspect = state.displayMode.aspect;
 
 	color_pitch = display_width*sizeof(u32);
+	flat_mode = state.displayMode.resolution;
+	flat_width = display_width; flat_height = display_height; flat_pitch = color_pitch;
+	flat_buffer_bytes = display_height*color_pitch;
 	color_buffer[0] = (u32*)rsxMemalign(64,(display_height*color_pitch));
 	color_buffer[1] = (u32*)rsxMemalign(64,(display_height*color_pitch));
 
@@ -164,8 +185,110 @@ void waitflip()
 	gcmResetFlipStatus();
 }
 
+// The renderer's flip (v88): queued without making the RSX wait there for the screen; the wait is owed
+// and made (settle_flip_wait) just before the next drawing into a display buffer, so the RSX gets on with
+// the next display list's own images meanwhile (at 60 fps it sat idle up to a refresh after every picture).
+int flip_wait_owed = 0;
+
+void settle_flip_wait()
+{
+	if(flip_wait_owed) { gcmSetWaitFlip(context); flip_wait_owed = 0; }
+}
+
+int stereo_set(int on)
+{
+	if(on==stereo_on) return 0;
+	if(!first_fb) { while(gcmGetFlipStatus()!=0) usleep(200); }
+	waitRSXIdle();
+	videoConfiguration vc;
+	memset(&vc,0,sizeof vc);
+	vc.format = VIDEO_BUFFER_FORMAT_XRGB;
+	if(on) {
+		videoResolution r;
+		if(videoGetResolution(VIDEO_RESOLUTION_720_3D_FRAME_PACKING,&r)!=0 || r.width!=1280 || r.height!=1470) {
+			printf("[ps3] 3D: no 720p frame packing mode (%d)\n",(int)r.height);
+			return -1;
+		}
+		const u32 pitch = 1280*4, bytes = pitch*1470;
+		if(bytes>flat_buffer_bytes) {
+			// The 2D display's buffers are too small (a 720p display): new ones (before the renderer takes the rest).
+			for(int b=0;b<2;b++) {
+				u32 *buf = (u32*)rsxMemalign(64,bytes);
+				if(!buf) { printf("[ps3] 3D: no room for the display buffers\n"); return -2; }
+				color_buffer[b] = buf;
+				rsxAddressToOffset(buf,&color_offset[b]);
+			}
+			flat_buffer_bytes = bytes;
+		}
+		vc.resolution = VIDEO_RESOLUTION_720_3D_FRAME_PACKING;
+		vc.pitch = pitch;
+		const s32 rc = videoConfigure(0,&vc,NULL,0);
+		if(rc!=0) { printf("[ps3] 3D: videoConfigure failed: 0x%08X\n",(u32)rc); return -3; }
+		for(int b=0;b<2;b++) memset(color_buffer[b],0,bytes);  // the 30 lines between the eyes stay black
+		color_pitch = pitch;
+		display_width = 1280; display_height = 720;
+		for(int b=0;b<2;b++) gcmSetDisplayBuffer(b,color_offset[b],pitch,1280,1470);
+		stereo_on = 1;
+	} else {
+		vc.resolution = flat_mode;
+		vc.pitch = flat_pitch;
+		const s32 rc = videoConfigure(0,&vc,NULL,0);
+		printf("[ps3] 3D off: videoConfigure 0x%02X: %d\n",flat_mode,(int)rc);
+		for(int b=0;b<2;b++) memset(color_buffer[b],0,flat_buffer_bytes);
+		color_pitch = flat_pitch;
+		display_width = flat_width; display_height = flat_height;
+		for(int b=0;b<2;b++) gcmSetDisplayBuffer(b,color_offset[b],flat_pitch,flat_width,flat_height);
+		stereo_on = 0;
+	}
+	// Until the system says the new mode is on.
+	for(int i=0;i<100;i++) {
+		videoState st;
+		videoGetState(0,0,&st);
+		if(st.state==0 && st.displayMode.resolution==vc.resolution) { printf("[ps3] 3D %s: mode 0x%02X on after %d ms\n",on?"on":"off",vc.resolution,i*50); break; }
+		usleep(50000);
+	}
+	setRenderTarget(curr_fb);
+	return 0;
+}
+
+void stereo_leave_for_exit()
+{
+	// Just the video mode (the renderer may be using the RSX from its own thread): back to 2D before the
+	// process ends.
+	if(!stereo_on) return;
+	videoConfiguration vc;
+	memset(&vc,0,sizeof vc);
+	vc.format = VIDEO_BUFFER_FORMAT_XRGB;
+	vc.resolution = flat_mode;
+	vc.pitch = flat_pitch;
+	const s32 rc = videoConfigure(0,&vc,NULL,0);
+	printf("[ps3] 3D off for exit: videoConfigure 0x%02X: %d\n",flat_mode,(int)rc);
+	stereo_on = 0;
+}
+
+int flip_pending()
+{
+	return !first_fb && gcmGetFlipStatus()!=0;
+}
+
+void flip_queue()
+{
+	if(!first_fb) waitflip();
+	else gcmResetFlipStatus();
+
+	gcmSetFlip(context,curr_fb);
+	rsxFlushBuffer(context);
+	flip_wait_owed = 1;
+
+	curr_fb ^= 1;
+	setRenderTarget(curr_fb);
+
+	first_fb = 0;
+}
+
 void flip()
 {
+	settle_flip_wait();
 	if(!first_fb) waitflip();
 	else gcmResetFlipStatus();
 
@@ -185,7 +308,7 @@ void clear_screen(u32 xrgb)
 {
 	for(int b=0;b<2;b++) {
 		u32 *p = color_buffer[b];
-		u32 n = (color_pitch/4)*display_height;
+		u32 n = (color_pitch/4)*(stereo_on ? 1470 : display_height);
 		for(u32 i=0;i<n;i++) p[i] = xrgb;
 	}
 }

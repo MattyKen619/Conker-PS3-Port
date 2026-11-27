@@ -123,8 +123,14 @@ const Texture* Recorder::get(const uint8_t* tmem, const Tile& tile, uint32_t tlu
     Sent* s = sent_slot(key, &found);
     if (!found || dl_ - s->last > 60) {
         // TEXDATA: the PPU decodes this one.
-        put(kOpTexData << 24 | (4 + kTileWords + 1024));
+        put(kOpTexData << 24 | (4 + kRiceWords + kTileWords + 1024));
         put((uint32_t)(key >> 32)); put((uint32_t)key); put(tlut_type);
+        const RiceLoad* const loads[2] = {&rice_tex, &rice_pal};  // texture packs: the loads it came from
+        for (const RiceLoad* r : loads) {
+            put((uint32_t)r->type << 24 | (uint32_t)r->siz << 16 | (uint32_t)r->masks << 8 | r->maskt);
+            put((uint32_t)r->uls << 16 | r->ult); put((uint32_t)r->lrs << 16 | r->lrt); put(r->addr);
+            put((uint32_t)r->width << 16 | (uint32_t)r->tsiz << 8); put((uint32_t)r->tmem);
+        }
         const uint32_t t[kTileWords] = {tile.fmt, tile.siz, tile.line, tile.tmem, tile.palette, tile.cms, tile.cmt, tile.masks,
                                         tile.maskt, tile.shifts, tile.shiftt, tile.uls, tile.ult, tile.lrs, tile.lrt, 0};
         for (uint32_t i = 0; i < kTileWords; i++) put(t[i]);
@@ -314,9 +320,19 @@ StreamPlayer::Result StreamPlayer::play_more(const uint32_t* s, uint32_t words, 
             break;
         }
         case kOpTexData: {
-            if (len != 4 + kTileWords + 1024) { *error = "bad TEXDATA"; return kFailed; }
+            if (len != 4 + kRiceWords + kTileWords + 1024) { *error = "bad TEXDATA"; return kFailed; }
             const uint64_t key = (uint64_t)from_be(p[0]) << 32 | from_be(p[1]);
             const uint32_t tlut = from_be(p[2]);
+            RiceLoad* rl[2] = {&cache_.rice_tex, &cache_.rice_pal};
+            for (int k = 0; k < 2; k++) {
+                const uint32_t* q = p + 3 + k * 6;
+                RiceLoad& r = *rl[k];
+                const uint32_t a = from_be(q[0]), b = from_be(q[1]), c = from_be(q[2]), e = from_be(q[4]);
+                r.type = (uint8_t)(a >> 24); r.siz = (uint8_t)(a >> 16); r.masks = (uint8_t)(a >> 8); r.maskt = (uint8_t)a;
+                r.uls = (uint16_t)(b >> 16); r.ult = (uint16_t)b; r.lrs = (uint16_t)(c >> 16); r.lrt = (uint16_t)c;
+                r.addr = from_be(q[3]); r.width = (uint16_t)(e >> 16); r.tsiz = (uint8_t)(e >> 8); r.tmem = (uint16_t)from_be(q[5]);
+            }
+            p += kRiceWords;
             Tile t;
             uint32_t* tf[] = {&t.fmt, &t.siz, &t.line, &t.tmem, &t.palette, &t.cms, &t.cmt, &t.masks, &t.maskt, &t.shifts, &t.shiftt,
                               &t.uls, &t.ult, &t.lrs, &t.lrt};

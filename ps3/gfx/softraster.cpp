@@ -13,6 +13,7 @@ namespace n64gfx {
 
 namespace {
     inline float clamp01(float v) { return v < 0 ? 0 : (v > 1 ? 1 : v); }
+    bool g_three_point = false;  // set per draw (SoftRaster::three_point, triangles with bilinear on)
 
     struct PixelInputs {
         float tex[2][4];
@@ -37,6 +38,21 @@ namespace {
             }
             return c;
         };
+        if (g_three_point && !tex->fb_addr) {
+            // The RDP's 3-point filter (the RSX's "like the N64" look): the texel's 3 nearest of 4.
+            const float fx = u - std::floor(u), fy = v - std::floor(v);
+            float q[4][4];
+            for (int k = 0; k < 4; k++) {
+                const int xx = fix(x + (k & 1), m.clamp_s, m.mirror_s, m.clamp_max_s, (int)tex->width);
+                const int yy = fix(y + (k >> 1), m.clamp_t, m.mirror_t, m.clamp_max_t, (int)tex->height);
+                const uint8_t* p = tex->rgba + ((size_t)yy * tex->width + xx) * 4;
+                for (int i = 0; i < 4; i++) q[k][i] = p[i] / 255.0f;
+            }
+            for (int i = 0; i < 4; i++)
+                out[i] = fx + fy < 1 ? q[0][i] + (q[1][i] - q[0][i]) * fx + (q[2][i] - q[0][i]) * fy
+                                     : q[3][i] + (q[2][i] - q[3][i]) * (1 - fx) + (q[1][i] - q[3][i]) * (1 - fy);
+            return;
+        }
         x = fix(x, m.clamp_s, m.mirror_s, m.clamp_max_s, (int)tex->width);
         y = fix(y, m.clamp_t, m.mirror_t, m.clamp_max_t, (int)tex->height);
         const uint8_t* p = tex->rgba + ((size_t)y * tex->width + x) * 4;
@@ -276,7 +292,38 @@ const DrawState& SoftRaster::with_frame_textures(const DrawState& st) {
 
 void SoftRaster::draw_triangles(const DrawState& st_in, const OutVertex* v, size_t count) {
     draw_id_++;
+    // GFX_FBLOG=1: the draws that read a frame (their first vertices' w: 1 for flat 2D ones).
+    if (std::getenv("GFX_FBLOG"))
+        for (int u = 0; u < 2; u++)
+            if (st_in.tex[u] && st_in.tex[u]->fb_addr && count >= 3)
+                std::printf("[fblog] draw %d: %zu vertices, tex%d frame 0x%X piece %ux%u at %d,%d, w %.2f %.2f %.2f, x %.1f %.1f %.1f\n", draw_id_, count, u,
+                            st_in.tex[u]->fb_addr, st_in.tex[u]->width, st_in.tex[u]->height, st_in.tex[u]->fb_x, st_in.tex[u]->fb_y,
+                            v[0].w, v[1].w, v[2].w, v[0].x, v[1].x, v[2].x);
+    // GFX_WHIST=1: each 3D vertex's w (its distance from the camera), counted in powers of 2 (3D's depth tuning).
+    {
+        static int on = -1;
+        static uint64_t bins[24];
+        static uint64_t n = 0;
+        if (on < 0) on = std::getenv("GFX_WHIST") != nullptr;
+        if (on && st_in.cimg_width >= 256) {
+            for (size_t i = 0; i < count; i++) {
+                float w = v[i].w;
+                int b = 0;
+                while (w >= 2.0f && b < 23) { w *= 0.5f; b++; }
+                bins[b]++;
+                n++;
+            }
+            static uint64_t last = 0;
+            if (n - last > 20000) {
+                last = n;
+                std::printf("[whist] %llu vertices:", (unsigned long long)n);
+                for (int b = 0; b < 24; b++) if (bins[b]) std::printf(" <%u:%.1f%%", 2u << b, bins[b] * 100.0 / n);
+                std::printf("\n");
+            }
+        }
+    }
     const DrawState& st = with_frame_textures(st_in);
+    struct TP { TP(bool on) { g_three_point = on; } ~TP() { g_three_point = false; } } tp(three_point && st.cycle() != CYC_COPY && ((st.om_h >> 12) & 3) >= 2);
     if (trace && !traced_tris_) { traced_tris_ = true; std::printf("[raster] tris cimg 0x%06X zimg 0x%06X zbuf %d zcmp %d zupd %d\n", st.cimg_addr, st.zimg_addr, st.z_buffered(), st.z_compare(), st.z_update()); }
     if (!trace) traced_tris_ = false;
     Target& t = target(st);
@@ -378,7 +425,36 @@ void SoftRaster::draw_triangles(const DrawState& st_in, const OutVertex* v, size
                     }
                     float shade[4] = {w0 * a.r + w1 * b.r + w2 * c.r, w0 * a.g + w1 * b.g + w2 * c.g,
                                       w0 * a.b + w1 * b.b + w2 * c.b, w0 * a.a + w1 * b.a + w2 * c.a};
+                    {  // GFX_PROBE=x,y: the triangles drawn over that pixel
+                        static int probe_x = -2, probe_y = -2;
+                        if (probe_x == -2) { const char* e = std::getenv("GFX_PROBE"); probe_x = -1; if (e) std::sscanf(e, "%d,%d", &probe_x, &probe_y); }
+                        if (x == probe_x && y == probe_y)
+                            std::printf("[probe] draw %u tri %zu cimg %06X: (%.1f %.1f %.1f %.1f) (%.1f %.1f %.1f %.1f) (%.1f %.1f %.1f %.1f) color %d %d %d\n", draw_id_, i / 3, st.cimg_addr,
+                                        v[i].x, v[i].y, v[i].z, v[i].w, v[i + 1].x, v[i + 1].y, v[i + 1].z, v[i + 1].w, v[i + 2].x, v[i + 2].y, v[i + 2].z, v[i + 2].w,
+                                        v[i].c[0], v[i].c[1], v[i].c[2]);
+                        if (x == probe_x && y == probe_y)
+                            for (int k = 0; k < 2; k++) if (const Texture* tx = st.tex[k]) {
+                                const TexMap& m = st.tmap[k];
+                                std::printf("[probe]   tex%d %ux%u fmt %u siz %u pal %u tlut %u hash %016llX shift %.3f %.3f off %.1f %.1f clamp %d %d (%.0f %.0f) mirror %d %d s %.1f t %.1f comb %06X:%08X\n",
+                                    k, tx->width, tx->height, tx->fmt, tx->siz, tx->palette, tx->tlut, (unsigned long long)tx->hash, m.shift_s, m.shift_t, m.offset_s, m.offset_t,
+                                    m.clamp_s, m.clamp_t, m.clamp_max_s, m.clamp_max_t, m.mirror_s, m.mirror_t, s, tt, st.combine_hi, st.combine_lo);
+                                char path[96]; std::snprintf(path, sizeof path, "/tmp/probe_%016llX_%ux%u.rgba", (unsigned long long)tx->hash, tx->width, tx->height);
+                                if (FILE* f = std::fopen(path, "wb")) { std::fwrite(tx->rgba, 4, (size_t)tx->width * tx->height, f); std::fclose(f); }
+                            }
+                    }
                     shade_pixel(st, t, z, x, y, d, shade, s, tt, use_z);
+                    {
+                        static int px_ = -2, py_ = -2;
+                        if (px_ == -2) { const char* e = std::getenv("GFX_PROBE"); px_ = -1; if (e) std::sscanf(e, "%d,%d", &px_, &py_); }
+                        static int bx0 = -2, by0, bx1, by1;
+                        if (bx0 == -2) { const char* e = std::getenv("GFX_PROBEBOX"); bx0 = -1; bx1 = -2; if (e) std::sscanf(e, "%d,%d,%d,%d", &bx0, &by0, &bx1, &by1); }
+                        if (x >= bx0 && x <= bx1 && y >= by0 && y <= by1 && st.tex[0]) { const uint8_t* o = &t.rgba[t.index(x, y) * 4];
+                            std::printf("[box] %d %d draw %d tex %016llX s %.2f t %.2f -> %02X%02X%02X\n", x, y, draw_id_, (unsigned long long)st.tex[0]->hash,
+                                        s * st.tmap[0].shift_s - st.tmap[0].offset_s, tt * st.tmap[0].shift_t - st.tmap[0].offset_t, o[0], o[1], o[2]); }
+                        if (x == px_ && y == py_) { const uint8_t* o = &t.rgba[t.index(x, y) * 4];
+                            std::printf("[probe]   -> %02X%02X%02X (margin %u) shade %.2f %.2f %.2f %.2f prim %.2f %.2f %.2f %.2f env %.2f %.2f %.2f %.2f om %08X:%08X\n", o[0], o[1], o[2], t.margin,
+                                shade[0], shade[1], shade[2], shade[3], st.prim[0], st.prim[1], st.prim[2], st.prim[3], st.env[0], st.env[1], st.env[2], st.env[3], st.om_h, st.om_l); }
+                    }
                 }
             }
         }

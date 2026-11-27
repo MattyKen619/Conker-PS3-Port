@@ -12,6 +12,7 @@
 // References: RT64 (MIT) for the F3DEX2 command handling, and CBFD-Recompiled's RT64 patch (based on
 // GLideN64's F3DEX2CBFD) for Conker's vertex lighting, texture generation and TRI4 command.
 #pragma once
+#include "rice_hash.h"
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -141,6 +142,14 @@ struct Memory {
 // ------------------------------------------------------------------------------- RDP state
 enum CycleType { CYC_1 = 0, CYC_2 = 1, CYC_COPY = 2, CYC_FILL = 3 };
 
+#if !defined(__SPU__)
+struct Texture;
+struct Tile;
+// Test hook (texture packs): called for each texture newly looked up, with its Rice checksum.
+inline void (*g_rice_hook)(const Texture* tex, const Tile& tile, bool ok, uint32_t crc, uint32_t palette_crc, bool has_palette,
+                           uint32_t hashed_w, uint32_t hashed_h) = nullptr;
+#endif
+
 struct Tile {
     uint32_t fmt = 0, siz = 0, line = 0, tmem = 0, palette = 0;
     uint32_t cms = 0, cmt = 0, masks = 0, maskt = 0, shifts = 0, shiftt = 0;
@@ -154,6 +163,11 @@ struct Texture {
     uint64_t hash = 0;              // identifies the decoded contents
     uint8_t fmt = 0, siz = 0, palette = 0, tlut = 0;  // what it was decoded from (diagnostics)
     void* backend_data = nullptr;   // e.g. the RSX copy of the image
+    // A texture pack has a picture for it (texture_pack.h): the backend draws that once it has it,
+    // found by the texture's hash. The texture's coordinates stay in N64 texels.
+#if !defined(__SPU__)  // (the SPU's texture pool has no room for it, nor use)
+    uint8_t hd_state = 0;
+#endif
     // A piece of a frame the game drew (loaded into TMEM from a color image, as the motion blur and the
     // pause screen's background do): no pixels here (game memory doesn't have what the backend drew);
     // the backend reads its own copy of the color image at fb_addr, from (fb_x, fb_y), width x height.
@@ -288,6 +302,9 @@ public:
     virtual const Texture* get(const uint8_t* tmem, const Tile& tile, uint32_t tlut_type, bool copy_mode) = 0;
     // The texture is used again (found through the interpreter's per-tile lookup).
     virtual void touch(const Texture* t) { (void)t; }
+    // Texture packs: the loads the next get()'s tile samples (its texture's and its palette's), set by
+    // the interpreter before it.
+    RiceLoad rice_tex, rice_pal;
 };
 
 // The dimensions of a tile's image (as the texture cache decodes it).
@@ -344,6 +361,9 @@ public:
     uint32_t capped = 0;  // images dropped for the cap (kMaxBytes)
     static constexpr size_t kMaxBytes = 12u << 20;
     std::function<void(Texture&)> on_evict;  // backends free their copy of the image here
+    // Texture packs: called for each texture newly decoded, with its tile, TLUT mode and loads; may set
+    // the texture's hd fields.
+    std::function<void(Texture&, const Tile&, uint32_t tlut, const RiceLoad&, const RiceLoad&)> on_decode;
     uint32_t decoded = 0;
 private:
     struct Entry { Texture tex; std::vector<uint8_t> pixels; uint32_t last_used; };
@@ -462,6 +482,13 @@ private:
     // RDP state.
     DrawState st_;
     struct { uint32_t fmt = 0, siz = 0, width = 0, addr = 0; } timg_;
+    // Texture packs: the last texture and palette loads, for the Rice checksum (rice_hash.h). The texture
+    // source is told the two a new texture came from (TextureSource::rice_tex, rice_pal).
+    RiceLoads rice_loads_;
+    void note_rice_load(uint8_t type, const Tile& t, uint32_t uls, uint32_t ult, uint32_t lrs, uint32_t lrt);
+#if !defined(__SPU__)
+    const Memory* rice_mem_ = nullptr;
+#endif
     Tile tiles_[8];
     alignas(16) uint8_t tmem_[4096] = {};
     uint32_t tmem_gen_ = 1;  // changes whenever TMEM is written
@@ -508,7 +535,9 @@ private:
     uint32_t group_ids_[8] = {}, group_counts_[8] = {}, group_vtx_[8] = {};  // RT64's matrix groups (the hooks name objects)
     int group_depth_ = 0;
     uint32_t ungrouped_[2] = {};  // matrices loaded outside groups: modelview, projection
-    void blend_matrix(uint64_t key, const Mat m, Mat out);
+    uint32_t proj_match_ = 0;     // modelviews outside groups: the segment (projections so far) of their counterparts in the last list
+    static constexpr int kNoBlend = 0x7FFFFFFF;
+    int blend_matrix(uint64_t key, uint64_t find_key, int radius, const Mat m, Mat out);
     float proj_change_ = 0, last_proj_change_ = 0;  // largest projection change (squared, relative) this list and last
 };
 

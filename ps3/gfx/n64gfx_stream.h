@@ -4,7 +4,8 @@
 //
 //   record header: op << 24 | length in words (header included)
 //   STATE    DrawState without its texture pointers (sent when it changed)
-//   TEXDATA  key (2 words), TLUT type, tile (16 words), TMEM (1024 words): a texture the PPU may not
+//   TEXDATA  key (2 words), TLUT type, the texture's and its palette's loads (6 words each, for texture
+//            packs' checksums), tile (16 words), TMEM (1024 words): a texture the PPU may not
 //            have decoded recently; it decodes it under the key
 //   TRIS     2 texture references (kTexRefWords each), 0-3 zero words so the vertices start on a
 //            16-byte boundary of the stream (tris_pad), then vertices (8 words each, OutVertex)
@@ -32,6 +33,7 @@ enum StreamOp : uint32_t {
 constexpr uint32_t kStateWords = 55;
 constexpr uint32_t kTexRefWords = 10;
 constexpr uint32_t kTileWords = 16;
+constexpr uint32_t kRiceWords = 12;  // TEXDATA's two loads (texture packs), 6 words each
 constexpr uint32_t kVertexWords = 8;
 // Padding words in a TRIS record that starts at word `at` of the stream.
 inline uint32_t tris_pad(uint32_t at) { return (4 - ((at + 1 + 2 * kTexRefWords) & 3)) & 3; }

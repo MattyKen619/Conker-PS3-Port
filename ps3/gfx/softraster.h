@@ -34,6 +34,7 @@ public:
     std::map<uint32_t, std::vector<float>> depths;  // by depth image address (laid out as its color target)
     std::map<uint32_t, uint32_t> depth_margin_;
     bool trace = false;  // print every rectangle with its state
+    bool three_point = false;  // triangles drawn with bilinear on: the RDP's 3-point filter (the RSX's N64 look)
     bool mipmaps = false;  // sample DrawState::mip by each pixel's texel density (as the RSX does), not level 0 alone
     float pix_lod_ = 0;    // that density's log2, for the pixel being drawn
     int draw_id_ = 0;      // trace: triangle draws so far, and which one last wrote each depth

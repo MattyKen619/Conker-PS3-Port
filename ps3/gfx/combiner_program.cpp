@@ -115,6 +115,24 @@ std::string generate_program(const ProgramKey& key) {
     std::string s = "!!ARBfp1.0\n#const c[0] = 1 0 0.5 0\n";
     if (key.mode == ProgramMode::Gray) s += "#const c[1] = 0.299 0.587 0.114 0\n";
     char line[160];
+    if (key.dither && key.dscale) {
+        // (One constant an instruction: the RSX keeps an instruction's constant inline after it, so a
+        // second one in the same instruction would share its slot. v78 had three, and drew black.)
+        std::snprintf(line, sizeof line, "#const c[2] = %.9f 0.25 0.5 %.9f\n#const c[3] = 255 7 0.125 31\n#const c[4] = 8 0.25 %.9f 0.5\n",
+                      1.0 / key.dscale, key.dither == 3 ? 0.5625 : 0.0625, 1.0 / 255.0);
+        s += line;
+    }
+    if (key.three_point) {
+        // The textures' sizes in texels and a texel in 0..1 (c[8], c[9]: texture 0 .xy, 1 .zw).
+        std::snprintf(line, sizeof line, "#const c[7] = 0.5 1 0 0\n#const c[8] = %u %u %u %u\n#const c[9] = %.9f %.9f %.9f %.9f\n",
+                      key.tp_w[0], key.tp_h[0], key.tp_w[1], key.tp_h[1], key.tp_w[0] ? 1.0 / key.tp_w[0] : 0.0,
+                      key.tp_h[0] ? 1.0 / key.tp_h[0] : 0.0, key.tp_w[1] ? 1.0 / key.tp_w[1] : 0.0, key.tp_h[1] ? 1.0 / key.tp_h[1] : 0.0);
+        s += line;
+    }
+    if (key.soft_w) {
+        std::snprintf(line, sizeof line, "#const c[5] = %.9f 0 0 0\n#const c[6] = 0.5 0.25 0 0\n", 0.5 / key.soft_w);
+        s += line;
+    }
     auto emit = [&](const char* fmt, auto... args) { std::snprintf(line, sizeof line, fmt, args...); s += line; s += "\n"; };
 
     if (key.mode == ProgramMode::Shade) {
@@ -126,6 +144,17 @@ std::string generate_program(const ProgramKey& key) {
     } else if (key.mode == ProgramMode::Copy) {
         if (key.tex_mask & 1) emit("TEX R2, f[TEX0], texture[0], 2D;");
         else emit("MOV R2, f[COL0];");
+        if ((key.tex_mask & 1) && key.soft_w) {
+            // Softened sideways, as the N64's video output: half the pixel, a quarter each from half an
+            // N64 pixel to the left and to the right.
+            emit("ADD R3, f[TEX0], c[5];");
+            emit("TEX R4, R3, texture[0], 2D;");
+            emit("ADD R3, f[TEX0], -c[5];");
+            emit("TEX R5, R3, texture[0], 2D;");
+            emit("ADD R4, R4, R5;");
+            emit("MUL R4, R4, c[6].yyyy;");
+            emit("MAD R2, R2, c[6].xxxx, R4;");
+        }
     } else {
         CombinerCycle cc[2];
         decode_combiner(key.combine_hi, key.combine_lo, cc);
@@ -133,12 +162,55 @@ std::string generate_program(const ProgramKey& key) {
         bool want[2] = {false, false};
         for (int c = 0; c < ncyc; c++) { want[0] |= uses_tex(cc[c], 0); want[1] |= uses_tex(cc[c], 1); }
         if (want[1] && !(key.tex_mask & 2)) want[0] = true;  // TEXEL1 falls back to texture 0
+        // The RDP's 3-point filter (RT64's, from emutalk's): the 3 texels nearest of the 4 around the
+        // point, blended across the triangle it falls in; the texture unit samples nearest; the sizes are
+        // constants (c[8], c[9]; c[7] = 0.5 1 0 0). Same texel centres as the RSX's own bilinear filter
+        // (point = uv * size - 0.5). Registers R14-R24 (free again after).
+        auto three_point = [&](int u, const char* dst) {
+            const char* tc = u ? "f[TEX1]" : "f[TEX0]";
+            const char* sz = u ? "c[8].zwzw" : "c[8].xyxy";   // texels
+            const char* tx = u ? "c[9].zwzw" : "c[9].xyxy";   // a texel in 0..1
+            // Read with a MOV first: fpasm (as PSL1GHT's cgcomp) turns off perspective correction for
+            // an input a MUL reads (v80-v84's flat-coloured polygons and Conker's missing pupils; the
+            // self-test's square, all at the same depth, couldn't tell).
+            emit("MOV R14.xy, %s;", tc);
+            emit("MUL R14.xy, R14, %s;", sz);
+            emit("ADD R14.xy, R14, -c[7].xxxx;");      // in texels, from texel centres
+            emit("FLR R15.xy, R14;");
+            emit("ADD R16.xy, R14, -R15;");            // the fraction
+            emit("ADD R15.xy, R15, c[7].xxxx;");
+            emit("MUL R17.xy, R15, %s;", tx);          // texel (0,0), in 0..1
+            emit("MOV R18.y, R17.y;");
+            emit("ADD R18.x, R17.x, %s;", u ? "c[9].z" : "c[9].x");  // (1,0)
+            emit("MOV R19.x, R17.x;");
+            emit("ADD R19.y, R17.y, %s;", u ? "c[9].w" : "c[9].y");  // (0,1)
+            emit("ADD R20.xy, R17, %s;", tx);          // (1,1)
+            emit("TEX R21, R17, texture[%d], 2D;", u);
+            emit("TEX R22, R18, texture[%d], 2D;", u);
+            emit("TEX R23, R19, texture[%d], 2D;", u);
+            emit("TEX R24, R20, texture[%d], 2D;", u);
+            // tri0 = s00 + (s10 - s00) fx + (s01 - s00) fy;  tri1 = s11 + (s01 - s11)(1 - fx) + (s10 - s11)(1 - fy)
+            emit("ADD R17, R22, -R21;");
+            emit("MAD R17, R17, R16.xxxx, R21;");
+            emit("ADD R18, R23, -R21;");
+            emit("MAD R17, R18, R16.yyyy, R17;");      // tri0
+            emit("ADD R19.xy, c[7].yyyy, -R16;");      // 1 - f
+            emit("ADD R18, R23, -R24;");
+            emit("MAD R18, R18, R19.xxxx, R24;");
+            emit("ADD R20, R22, -R24;");
+            emit("MAD R18, R20, R19.yyyy, R18;");      // tri1
+            emit("ADD R19.z, R16.x, R16.y;");
+            emit("SGE R19.z, R19.z, c[7].y;");         // past the diagonal
+            emit("LRP %s, R19.zzzz, R18, R17;", dst);
+        };
         if (want[0]) {
-            if (key.tex_mask & 1) emit("TEX R0, f[TEX0], texture[0], 2D;");
+            if ((key.tex_mask & 1) && (key.three_point & 1)) three_point(0, "R0");
+            else if (key.tex_mask & 1) emit("TEX R0, f[TEX0], texture[0], 2D;");
             else emit("MOV R0, %s;", kZero);
         }
         if (want[1]) {
-            if (key.tex_mask & 2) emit("TEX R1, f[TEX1], texture[1], 2D;");
+            if ((key.tex_mask & 2) && (key.three_point & 2)) three_point(1, "R1");
+            else if (key.tex_mask & 2) emit("TEX R1, f[TEX1], texture[1], 2D;");
             else if (key.tex_mask & 1) emit("MOV R1, R0;");
             else emit("MOV R1, %s;", kZero);
         }
@@ -166,6 +238,36 @@ std::string generate_program(const ProgramKey& key) {
     if (key.alpha_test) {
         emit("ADDC R6.x, R2.wwww, -f[TEX1].zzzz;");
         emit("KIL LT.x;");
+    }
+    if (key.dither && key.dscale) {
+        // As the RDP writes a 16-bit frame (angrylion's rgb_dither): 5 bits a channel, rounded up when
+        // the 3 bits dropped exceed the pattern's value d at this N64 pixel: floor((c + 7 - d) / 8).
+        if (key.dither >= 2) {
+            emit("MUL R13.xy, f[WPOS], c[2].xxxx;");  // N64 pixels
+            emit("FLR R13.xy, R13;");
+            emit("MUL R13.xy, R13, c[2].yyyy;");
+            emit("FRC R13.xy, R13;");                  // x, y mod 4, over 4
+            emit("MAD R13.x, R13.x, c[2].z, c[2].w;");  // the pattern's column (Bayer: the right half)
+            emit("ADD R13.y, R13.y, c[3].z;");
+            emit("TEX R14, R13, texture[2], 2D;");
+            emit("MUL R14.x, R14.x, c[3].x;");
+            emit("ADD R14.x, R14.x, c[4].w;");
+            emit("FLR R14.x, R14.x;");                 // d
+            emit("ADD R14.x, c[3].y, -R14.x;");        // 7 - d
+        } else {
+            emit("MOV R14.x, %s;", kZero);             // no dither: the 3 bits dropped
+        }
+        emit("MUL R15.xyz, R2, c[3].xxxx;");
+        emit("ADD R15.xyz, R15, c[4].wwww;");
+        emit("FLR R15.xyz, R15;");                     // the 8-bit colour
+        emit("ADD R15.xyz, R15, R14.xxxx;");
+        emit("MUL R15.xyz, R15, c[3].zzzz;");
+        emit("FLR R15.xyz, R15;");
+        emit("MIN R15.xyz, R15, c[3].wwww;");          // 5 bits
+        emit("MUL R16.xyz, R15, c[4].yyyy;");
+        emit("FLR R16.xyz, R16;");
+        emit("MAD R15.xyz, R15, c[4].xxxx, R16;");     // shown as the VI does: (c << 3) | (c >> 2)
+        emit("MUL R2.xyz, R15, c[4].zzzz;");
     }
     emit("MOV result.color, R2;");
     emit("END");

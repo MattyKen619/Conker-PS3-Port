@@ -5,6 +5,7 @@
 // assembled at runtime by fpasm); textures are uploaded once per decoded image. present() draws the
 // target the VI is showing onto the display buffer and flips.
 #pragma once
+#include <unordered_set>
 #include <map>
 #include <string>
 #include <unordered_map>
@@ -14,6 +15,7 @@
 
 #include "combiner_program.h"
 #include "n64gfx.h"
+#include "texture_pack.h"
 #include "vram_arena.h"
 #include "widescreen.h"
 
@@ -31,10 +33,14 @@ public:
         uint32_t cmd_kb = 0;                              // command buffer size
         uint32_t fb_draws = 0, fb_missing = 0;            // draws reading a frame the game drew (found / not)
         uint32_t film_frames = 0;                         // old-film scratches drawn (frames shown in grey)
+        uint32_t hd_evicted = 0;                          // and freed again to make room
+        uint32_t hd_textures = 0;                         // texture pack textures uploaded
+        uint32_t hd_without_key = 0;                      // draws of a picture whose texture's decode found no key
         uint32_t mid_presents = 0;                        // in-between frames shown (frame interpolation)
         // Why each picture was shown: a frame drawn since it was last shown; the VI moved to another
         // frame not drawn since (an older picture); the same frame at another row.
         uint32_t present_drawn = 0, present_older = 0, present_moved = 0;
+        uint32_t present_busy = 0;  // VIs left out: the last picture not on screen yet (3 ms waited)
         uint32_t present_older_waited = 0;
         uint32_t targets_freed = 0, depths_freed = 0;     // render targets and depth buffers freed                // VIs an older picture wasn't shown (waiting for its frame to be drawn)
         uint32_t scratch_max_kb = 0;                      // most frame texture copy memory one pass used
@@ -103,6 +109,10 @@ public:
     // rectangles, 1:1; with logo_hashes set, the backend notes the ones whose texture is in it. Once a
     // logo of at least logo_min_tiles tiles has been drawn logo_min_lists lists running, logo_image()
     // gives it as one RGBA image (see-through around it), put together from the textures themselves.
+    // A texture pack (texture_pack.h): its pictures replace textures once prepared.
+    TexturePack* pack = nullptr;
+    // Asks for a texture's picture from the pack, unless it's here or asked for already.
+    void want_hd(uint64_t hash, const TexturePack::Job& job);
     std::vector<uint64_t> logo_hashes;
     uint32_t logo_min_tiles = 0, logo_min_lists = 15;
     bool logo_image(std::vector<uint8_t>& rgba, uint32_t* w, uint32_t* h);
@@ -129,8 +139,26 @@ public:
     bool use_vertex_memory(void* buffer, uint32_t bytes);
     // Goes back to the vertex ring in RSX memory (if the self-test failed with main memory).
     void use_rsx_vertex_memory();
+    // The pack's pictures: bytes held, and the most they may take now.
+    size_t hd_bytes() const { return hd_bytes_; }
+    size_t hd_budget() const;
 
 private:
+    // The pack's pictures uploaded, by their texture's hash: kept while there's room, whatever becomes of
+    // the texture (the game's textures come and go with every cut of a cutscene), so one seen again is
+    // there at once.
+    struct RsxTex;
+    struct HdTex { RsxTex* rt = nullptr; uint32_t last_used = 0, bytes = 0; uint16_t w = 0, h = 0; };
+    std::unordered_map<uint64_t, HdTex> hd_;
+    std::unordered_set<uint64_t> hd_pending_;
+    size_t hd_bytes_ = 0;
+    // What each texture's picture is made from (want_hd), so one freed for room can be asked for again
+    // when its texture is next drawn; and those that didn't fit, not to be tried again at once.
+    std::unordered_map<uint64_t, TexturePack::Job> hd_jobs_;
+    static uint64_t hd_key(const TexturePack::Job& j);
+    std::unordered_map<uint64_t, uint32_t> hd_failed_;
+    void take_hd();   // the pictures the background thread has ready
+    void evict_hd(size_t need);
     SplitViews views_;  // split-screen views, for rectangles drawn over them (widescreen.h)
     WideFilm film_;
     struct LogoTile { int x, y; std::vector<uint8_t> rgba; };
@@ -143,13 +171,19 @@ private:
         uint32_t w = 0, h = 0, pitch = 0, depth_pitch = 0;
         void* color = nullptr; uint32_t color_off = 0;
         void* depth = nullptr; uint32_t depth_off = 0;
+        // Multisampling (anti-aliasing, v77): the RSX's sample layout (GCM_SURFACE_*) and the samples
+        // across and down per pixel; the colour and depth images are sx * w by sy * h in memory.
+        uint8_t aa = 0, sx = 1, sy = 1;
+        // 3D (stereo_on, frame-sized images): 2, the right eye's picture below the left eye's (the surface
+        // is h * eyes tall; h is one eye's); each draw goes to both (draw()).
+        uint8_t eyes = 1;
         bool dirty = false;  // drawn since last presented
         bool mid_ready = false;  // an in-between frame copy: drawn and not yet shown
         uint32_t last_used = 0;  // the display list (dl_seq_) it was last drawn, read or shown in
         uint32_t drawn_dl = 0;   // the display list it was last drawn in
         uint32_t film_dl = ~0u;  // the display list that drew the old-film look's scratches into it
     };
-    struct RsxTex { void* mem = nullptr; uint32_t off = 0, pitch = 0; };
+    struct RsxTex { void* mem = nullptr; uint32_t off = 0, pitch = 0; uint32_t levels = 1; uint8_t dxt = 0; };  // levels > 1: swizzled, pitch 0
     // A vertex as the draw stream holds one (OutVertex): the RSX reads the stream's own vertices where
     // they are; what a draw shares is in the vertex program's constants (VpConsts).
     struct Vertex {
@@ -158,7 +192,8 @@ private:
         uint8_t shade[4];
         uint32_t pad;
     };
-    struct VpConsts { float c[7][4]; };  // see shaders/n64gfx_vp.asm
+    struct VpConsts { float c[8][4]; };  // see shaders/n64gfx_vp.asm
+    static constexpr u32 kVpConstCount = sizeof(VpConsts) / sizeof(float[4]);
     VpConsts vpc_{};
     bool vpc_valid_ = false;
     void set_consts(const VpConsts& k);
@@ -189,13 +224,34 @@ public:
     // filtering (minification LINEAR), 3 LOD bias -4, 4 no mipmapped textures at all.
     int mip_variant = 0;
     void dump_mips(const char* dir, uint32_t tag);
+    // Frame-sized colour images and depth buffers in tile regions (v73); tiles_in_use(): how many now,
+    // tiles_bound(): bound in all, tiles_refused(): frame-sized surfaces that got none.
+    bool tiling = true;
+    // The picture's look (v78): false "clean" (sharper textures on surfaces seen at an angle: anisotropic
+    // filtering), true "like the N64" (16-bit colour with the RDP's dither, the video output's softness).
+    bool n64_look = false;
+    // Anti-aliasing (v77): the RSX's multisampling, 4 samples a pixel at 432 and 648 lines, 2 at 864, none
+    // at 1080 (memory and bandwidth). Changing it starts the images again, as a resolution change does.
+    bool antialias() const { return antialias_; }
+    bool set_antialias(bool on);
+    // 3D: depth d (each eye's farthest shift, in -1..1 units), the distance at the screen's depth
+    // (convergence, in the game's w), and k: how much nearer things may come out (times d).
+    void set_stereo(float depth, float convergence, float k) { stereo_d_ = depth; stereo_conv_ = convergence; stereo_k_ = k; }
+    // 3D's ghost cancellation: each eye's picture less `leak` of the other's (what a 3D TV lets through),
+    // the black raised to make room (0: off). Returns false if its program couldn't be made.
+    bool set_ghost(float leak);
+    uint32_t tiles_in_use() const { return (uint32_t)tiles_.size(); }
+    uint32_t tiles_bound() const { return tiles_bound_total_; }
+    uint32_t tiles_refused() const { return tiles_refused_; }
 private:
     uint64_t last_mip_key_ = 0;
     uint32_t last_mip_levels_ = 0;
     std::vector<uint64_t> debug_mip_keys_;
     std::unordered_map<uint64_t, MipTex> mips_;
+    bool dxt_ok_ = true;   // the self-test drew DXT1 and DXT5 textures right (a texture pack's pictures are kept so)
     bool mips_ok_ = true;  // the self-test drew them right
     RsxTex* mip_texture(const Texture* base, const DrawState& st);
+    RsxTex* hd_texture(const TexturePack::Ready& r);  // a texture pack's picture, prepared in the background
     void evict_mips();
     // Render targets: one replaced (its width changed) or unused for a while (the game's buffers move
     // about between levels and scenes) has its memory freed once the RSX is past it, and a depth
@@ -207,15 +263,33 @@ private:
     // reads it: an intensity image's red in every channel), so it then works as an ordinary texture
     // (exact size, the tile's clamp/wrap/mirror). False if a frame isn't there (skip the draw).
     bool copy_frame_pieces(const DrawState& st, uint32_t tex_mask);
-    struct FbCopy { uint32_t off = 0, pitch = 0, w = 0, h = 0, ext_l = 0, texels_w = 0; } fb_copy_[2];
+    // off_r: 3D, the same piece of the right eye's picture (0: none); draw() reads it for the right eye.
+    struct FbCopy { uint32_t off = 0, off_r = 0, pitch = 0, w = 0, h = 0, ext_l = 0, texels_w = 0; } fb_copy_[2];
+    uint32_t fb_right_[2] = {};  // 3D: per texture unit, the bound frame piece's right-eye copy (0: none)
+    gcmTexture fb_tx_[2];        // and how it was bound (for the left eye)
     uint32_t fb_ext_[2][2] = {};  // per texture unit: N64 columns of margin read left / right of a frame piece
     void widen_frame_rect(const DrawState& st, float* ulx, float* lrx, float* s, float dsdx);
     uint8_t* scratch_ = nullptr;  // two halves, used by alternate display lists
     uint32_t scratch_size_ = 0;
     void alloc_scratch();
+    // Tiled RSX memory for the frame-sized colour images and depth buffers (v73): the RSX reads and
+    // writes a tile region's pixels in blocks, much faster than in rows (a "pitch" surface). The PPU and
+    // the texture unit see the pixels as rows all the same (no compression). 15 regions; a size that
+    // doesn't get one is allocated in rows as before.
+    bool antialias_ = false;
+    uint32_t dither_off_ = 0;  // the dither patterns (texture 2): magic square, then Bayer, 4 x 4 each
+    void apply_look(ProgramKey& key, const DrawState& st) const;
+    uint8_t three_point_units(const DrawState& st, uint8_t tex_mask, bool bilinear) const;
+    void aa_layout(uint8_t* mode, uint8_t* sx, uint8_t* sy) const;
+    bool reset_images(const char* why);
+    std::unordered_map<void*, uint8_t> tiles_;
+    uint16_t tiles_used_ = 0;
+    uint32_t tiles_bound_total_ = 0, tiles_refused_ = 0;
+    void* alloc_surface(uint32_t row_bytes, uint32_t rows, uint32_t* pitch);
+    void free_vram(void* mem);
     struct DepthBuf { void* mem = nullptr; uint32_t off = 0, pitch = 0; };
     std::map<uint64_t, DepthBuf> depths_;  // one per target size
-    const DepthBuf* depth_for(uint32_t w, uint32_t h, bool* fresh);
+    const DepthBuf* depth_for(uint32_t w, uint32_t h, uint32_t sx, uint32_t sy, bool* fresh);
     static constexpr uint32_t kTsSlots = 16, kLabelTs = 106, kLabelStream = 107;  // 107, 108
     uint32_t stream_fence_[2] = {0, 0}, stream_seq_ = 0;
     uint64_t ts_kick_[16] = {};
@@ -236,9 +310,10 @@ private:
     void wait_label(uint32_t index, uint32_t value);
     // Restarts the command buffer at its beginning when less than 128 KB is left (see the .cpp).
     void ensure_cmd_space();
-    bool test_draw(const char* name, const char* fp_source, uint32_t rgba, bool textured);
+    bool test_draw(const char* name, const char* fp_source, uint32_t rgba, bool textured, const float* c7 = nullptr);
+    bool three_point_ok_ = true;  // the self-test's 3-point check passed (else the N64 look keeps bilinear)
     void begin_display();
-    void load_display_texture(uint32_t offset, uint32_t w, uint32_t h, uint32_t pitch);
+    void load_display_texture(uint32_t offset, uint32_t w, uint32_t h, uint32_t pitch, u8 unit = 0);
     void display_quad(float fw, float fh, float u1, float v0, float v1, bool wide = false);
     bool fence(const char* what);   // false (and hung_) if the RSX did not get there within 1 s
     void note(const char* fmt, ...);  // remember an operation for the hang report
@@ -251,7 +326,7 @@ private:
         bool valid = false;
         uint32_t fp_offset = ~0u;
         bool vp_loaded = false;
-        struct Tex { uint32_t offset = ~0u, w = 0, h = 0, pitch = 0; uint8_t filter = 0, ws = 0, wt = 0, levels = 0; } tex[2];
+        struct Tex { uint32_t offset = ~0u, w = 0, h = 0, pitch = 0; uint8_t filter = 0, ws = 0, wt = 0, levels = 0, dxt = 0; } tex[2];
         int sc[4] = {-1, -1, -1, -1};
         float vp[8] = {}; uint32_t vp_w = 0, vp_h = 0;
         int blend = -1; uint16_t bsrc = 0, bdst = 0;
@@ -276,6 +351,15 @@ private:
     uint8_t* rsx_ring_ = nullptr;
     uint32_t rsx_ring_off_ = 0;
     uint32_t draws_since_flush_ = 0;
+    // 3D (the vertex program's c[8]).
+    float stereo_d_ = 0.02f, stereo_conv_ = 400.0f, stereo_k_ = 1.5f;
+    bool draw_3d_ = false;  // this draw is 3D (triangles): each eye from its own side; else at the screen's depth
+    float c8_[4] = {0, 0, 0, 0};
+    float ghost_ = 0;                  // set_ghost's leak
+    std::vector<uint8_t> ghost_blob_;  // its program (and where its code is in RSX memory)
+    uint32_t ghost_off_ = 0;
+    bool c8_valid_ = false;
+    void load_c8(float eye_sign, bool shifted);
     uint32_t seg_fence_[4] = {};
     // Fence for freeing textures: label written at the end of every display list.
     uint32_t dl_seq_ = 0;

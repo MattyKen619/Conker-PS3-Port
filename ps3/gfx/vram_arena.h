@@ -57,6 +57,11 @@ public:
         free_[start] = len;
     }
     uint32_t in_use() const { return in_use_; }
+    uint32_t size_of(const void* p) const {  // an allocation's size (with its gap), 0 if not one
+        if (!p) return 0;
+        auto u = used_.find((uint32_t)((const uint8_t*)p - base_));
+        return u == used_.end() ? 0 : u->second;
+    }
     uint32_t size() const { return size_; }
     size_t blocks() const { return used_.size(); }
 

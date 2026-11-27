@@ -283,7 +283,7 @@ uint64_t tile_hash(const uint8_t* tmem, const Tile& tile, uint32_t tlut_type) {
         // The palette entries this tile can use, their colours only (v74): an entry is 8 bytes of TMEM
         // here (0x800 + i * 8) but only its first 2 are the colour (tlut_color); the other 6 hold
         // whatever was there, and hashing them gave the same picture new hashes: decoded and uploaded
-        // again, its pack picture asked for again (1.1's crash in It's War: main memory ran out).
+        // again, its pack picture asked for again (v65-v72's switching, 18,548 uploads in 8 minutes).
         // 4-bit texels: the 16 entries of the tile's palette number; 8-bit: entries 0 up to the
         // highest index the texels use.
         uint32_t first = 0, count = 16;
@@ -311,13 +311,19 @@ void decode_tile(const uint8_t* tmem, const Tile& tile, uint32_t tlut_type, uint
     tile_range(tile, h, &start, &len);
     const bool palette = uses_palette(tile, tlut_type);
     const uint32_t line = tile.line * 8;
+    // With a palette (TLUT), the RDP reads the texels from TMEM's low half only (the palette is in the high
+    // half): an address past 0x7FF wraps to the start. Conker's catfish heads (issue #2): their 48 x 44 CI8
+    // tiles' last row is at 0x810, past the end, and the heads' tops are drawn from it (clamped there); read
+    // from 0x810 itself, they showed the palette's and the texture's leftovers as purple specks, on the N64
+    // they're row 0's black.
+    const uint32_t low = palette ? 0x7FF : 0xFFF;
     for (uint32_t y = 0; y < h; y++) {
         uint32_t row = start + y * line;
         for (uint32_t x = 0; x < w; x++) {
             uint8_t* o = px + ((size_t)y * w + x) * 4;
             switch (tile.siz) {
             case 0: {  // 4-bit
-                uint8_t b = tmem8(tmem, row + (x >> 1), y);
+                uint8_t b = tmem8(tmem, (row + (x >> 1)) & low, y);
                 uint8_t n = (x & 1) ? (b & 15) : (b >> 4);
                 if (palette) tlut_color(tmem, (tile.palette << 4) | n, tlut_type, o);
                 else if (tile.fmt == 3) {  // IA4: 3-bit intensity, 1-bit alpha
@@ -329,7 +335,7 @@ void decode_tile(const uint8_t* tmem, const Tile& tile, uint32_t tlut_type, uint
                 break;
             }
             case 1: {  // 8-bit
-                uint8_t b = tmem8(tmem, row + x, y);
+                uint8_t b = tmem8(tmem, (row + x) & low, y);
                 if (palette) tlut_color(tmem, b, tlut_type, o);
                 else if (tile.fmt == 3) { o[0] = o[1] = o[2] = (uint8_t)((b >> 4) * 17); o[3] = (uint8_t)((b & 15) * 17); }
                 else { o[0] = o[1] = o[2] = o[3] = b; }
@@ -378,9 +384,20 @@ const Texture* TextureCache::get_hashed(uint64_t hsh, const uint8_t* tmem, const
     bytes_ += e->pixels.size();
     e->last_used = frame_;
     decode_tile(tmem, tile, tlut_type, e->pixels.data());
+#if !defined(__SPU__) && !defined(__PPU__)
+    if (const char* tl = std::getenv("GFX_TILELOG"); tl && (tl[0] == '*' || std::strtoull(tl, nullptr, 16) == hsh))
+        std::printf("[tile] %016llX fmt %u siz %u line %u tmem %u pal %u cms %u cmt %u mask %u %u shift %u %u s %u-%u t %u-%u tlut %u\n",
+                    (unsigned long long)hsh, tile.fmt, tile.siz, tile.line, tile.tmem, tile.palette, tile.cms, tile.cmt, tile.masks, tile.maskt,
+                    tile.shifts, tile.shiftt, tile.uls, tile.lrs, tile.ult, tile.lrt, tlut_type);
+    if (const char* tl = std::getenv("GFX_TILELOG"); tl && std::strtoull(tl, nullptr, 16) == hsh) {
+        char path[64]; std::snprintf(path, sizeof path, "/tmp/tmem_%016llX.bin", (unsigned long long)hsh);
+        if (FILE* f = std::fopen(path, "wb")) { std::fwrite(tmem, 1, 4096, f); std::fclose(f); }
+    }
+#endif
     Texture& t = e->tex;
     t.rgba = e->pixels.data(); t.width = w; t.height = h; t.hash = hsh;
     t.fmt = (uint8_t)tile.fmt; t.siz = (uint8_t)tile.siz; t.palette = (uint8_t)tile.palette; t.tlut = (uint8_t)tlut_type;
+    if (on_decode) on_decode(t, tile, tlut_type, rice_tex, rice_pal);
     entries_[hsh] = e;
     return &t;
 }
@@ -451,29 +468,76 @@ void Interpreter::update_mvp() {
 
 // Frame interpolation: this matrix and its counterpart in the last display list, halfway. Not blended
 // when there's none, or when they're far apart (a camera cut, or not the same thing after all).
-void Interpreter::blend_matrix(uint64_t key, const Mat m, Mat out) {
+// Its counterpart: last list's under find_key, or (radius > 0) the nearest of those up to radius
+// places either side (the low 16 bits of the key), unless find_key's own is the same matrix. Returns
+// the place offset of the counterpart blended with, or kNoBlend.
+//
+// Near: within a fifth of its size; for a projection, row by row (v88: a projection whose -80 near-plane
+// term dwarfed the rest passed as 5% from a matrix that also turned the camera: the in-between frame's
+// camera pointed elsewhere, a wall at the lens went behind it and half the picture showed the room past it).
+int Interpreter::blend_matrix(uint64_t key, uint64_t find_key, int radius, const Mat m, Mat out) {
     stats.matrices++;
     history_->store(key, m);
-    alignas(16) Mat prev;
-    if (history_->find(key, prev)) {
-        float d = 0, n = 0;
-        for (int i = 0; i < 4; i++)
-            for (int j = 0; j < 4; j++) { const float e = m[i][j] - prev[i][j]; d += e * e; n += m[i][j] * m[i][j]; }
+    alignas(16) Mat prev, cand;
+    // score: the squared difference over the squared size; for a projection, the largest of its rows'
+    // (an object's whole matrix as before: some turn ~100 degrees a frame and blended fine)
+    const bool rows = (key & 0x80000000u) != 0;
+    auto score_of = [&](const Mat p, float* d_all) {
+        float worst = 0, d = 0, n = 0;
+        for (int i = 0; i < 4; i++) {
+            float di = 0, ni = 0;
+            for (int j = 0; j < 4; j++) { const float e = m[i][j] - p[i][j]; di += e * e; ni += m[i][j] * m[i][j]; }
+            d += di; n += ni;
+            const float sc = di <= 1e-12f ? 0.0f : ni > 0 ? di / ni : 1e9f;
+            if (sc > worst) worst = sc;
+        }
+        *d_all = d;
+        return rows ? worst : d <= 1e-12f ? 0.0f : n > 0 ? d / n : 1e9f;
+    };
+    float best = 1e30f, best_d = 0;
+    int best_k = kNoBlend;
+    for (int k = 0; k <= 2 * radius; k++) {
+        const int off = (k & 1) ? (k + 1) / 2 : -(k / 2);  // 0, 1, -1, 2, -2, ...
+        const int place = (int)(find_key & 0xFFFF) + off;
+        if (place < 0 || place > 0xFFFF) continue;
+        if (!history_->find((find_key & ~(uint64_t)0xFFFF) | (uint32_t)place, cand)) continue;
+        float d;
+        const float sc = score_of(cand, &d);
+        if (sc < best) { best = sc; best_d = d; best_k = off; std::memcpy(prev, cand, sizeof(Mat)); }
+        if (best <= 1e-6f) break;  // the same matrix
+    }
+    if (best_k != kNoBlend) {
+        float n = 0;
+        for (int i = 0; i < 4; i++) for (int j = 0; j < 4; j++) n += m[i][j] * m[i][j];
 #if !defined(__SPU__)
-        if (debug_blend) N64GFX_LOG("[blend] dl %u key %08x:%08x rel %.4f\n", stats.dls, (unsigned)(key >> 32), (unsigned)key, n > 0 ? std::sqrt(d / n) : 0.0f);
+        if (debug_blend) N64GFX_LOG("[blend] dl %u key %08x:%08x (with %+d) rel %.4f, rows %.4f\n", stats.dls, (unsigned)(key >> 32), (unsigned)key, best_k,
+                                    n > 0 ? std::sqrt(best_d / n) : 0.0f, std::sqrt(best));
+        if (debug_blend && std::getenv("GFX_MATS") && ((key & 0x80000000u) || std::getenv("GFX_MATS")[0] == 'a'))
+            for (int i = 0; i < 4; i++) N64GFX_LOG("   m %10.4f %10.4f %10.4f %10.4f   prev %10.4f %10.4f %10.4f %10.4f\n", m[i][0], m[i][1], m[i][2], m[i][3], prev[i][0], prev[i][1], prev[i][2], prev[i][3]);
 #endif
         // A projection that changed (the game's are steady while a shot lasts; a cut changes the field of
         // view): the in-between frame would show a camera that never was.
         // (A zoom changes it a little every frame: only a sudden change counts, see run().)
-        if ((key & 0x80000000u) && (uint32_t)(key >> 32) == 0x554E4752u && n > 0) proj_change_ = std::max(proj_change_, d / n);
-        if (d <= 0.04f * n) {  // within a fifth of its size
+        if ((key & 0x80000000u) && (uint32_t)(key >> 32) == 0x554E4752u && n > 0) proj_change_ = std::max(proj_change_, best_d / n);
+        // An object that turned far in one frame (more than ~45 degrees about any axis): the average of its
+        // two orientations is a squashed model (v93: Conker snapping round, a flattened side-on Conker in
+        // the in-between frame, a flicker); it's drawn as in its frame instead, as the PC port does.
+        bool turned = false;
+        if (!rows)
+            for (int i = 0; i < 3 && !turned; i++) {
+                float dot = 0, na = 0, nb = 0;
+                for (int j = 0; j < 3; j++) { dot += m[i][j] * prev[i][j]; na += m[i][j] * m[i][j]; nb += prev[i][j] * prev[i][j]; }
+                if (na > 1e-12f && nb > 1e-12f && dot < 0.7071f * std::sqrt(na * nb)) turned = true;
+            }
+        if (best <= 0.04f && !turned) {  // within a fifth of its size (a projection: every row)
             for (int i = 0; i < 4; i++)
                 for (int j = 0; j < 4; j++) out[i][j] = (m[i][j] + prev[i][j]) * 0.5f;
             stats.matrices_blended++;
-            return;
+            return best_k;
         }
     }
     std::memcpy(out, m, sizeof(Mat));
+    return kNoBlend;
 }
 
 void Interpreter::cmd_matrix(const Memory& mem, uint32_t w0, uint32_t w1) {
@@ -485,14 +549,27 @@ void Interpreter::cmd_matrix(const Memory& mem, uint32_t w0, uint32_t w1) {
         // Its key: the object's group (the hooks' ids) and its place in it, or its place among the
         // matrices outside groups (modelview and projection counted apart).
         const uint32_t kind = (p & 4) ? 1 : 0;
-        uint64_t key;
-        if (group_depth_ > 0) key = (uint64_t)group_ids_[group_depth_ - 1] << 32 | kind << 31 | group_counts_[group_depth_ - 1]++;
-        else if (kind) { key = 0x554E4752ull << 32 | 1ull << 31 | ungrouped_[1]++; ungrouped_[0] = 0; }
-        // A modelview outside groups: its place after the last projection outside groups (the HUD's
-        // chocolate pieces come right after its own projection; counted from the list's start, a matrix
-        // more or fewer earlier in the scene paired each piece with its neighbour's last frame).
-        else key = 0x554E4752ull << 32 | (uint64_t)ungrouped_[1] << 16 | ungrouped_[0]++;
-        blend_matrix(key, m, mm);
+        if (group_depth_ > 0) {
+            const uint64_t key = (uint64_t)group_ids_[group_depth_ - 1] << 32 | kind << 31 | group_counts_[group_depth_ - 1]++;
+            blend_matrix(key, key, 0, m, mm);
+        } else if (kind) {
+            // A projection outside groups: by its count, or the nearest of the counts 2 either side (v88:
+            // every other list loads one more before the camera's own, which shifted every pairing after).
+            const uint32_t c = ungrouped_[1]++;
+            const uint64_t key = 0x554E4752ull << 32 | 1ull << 31 | c;
+            const int off = blend_matrix(key, key, 2, m, mm);
+            proj_match_ = (off == kNoBlend ? c : (uint32_t)((int)c + off)) + 1;  // (modelviews after it count it)
+            ungrouped_[0] = 0;
+        } else {
+            // A modelview outside groups: its place after the last projection outside groups (the HUD's
+            // chocolate pieces come right after its own projection; counted from the list's start, a matrix
+            // more or fewer earlier in the scene paired each piece with its neighbour's last frame), looked
+            // for after that projection's counterpart, 4 places either side (v87: objects drawn in
+            // another order from one frame to the next, a door's panel paired with its neighbour).
+            const uint32_t place = ungrouped_[0]++;
+            const uint64_t key = 0x554E4752ull << 32 | (uint64_t)ungrouped_[1] << 16 | place;
+            blend_matrix(key, 0x554E4752ull << 32 | (uint64_t)proj_match_ << 16 | place, 4, m, mm);
+        }
     }
     if (p & 4) {  // projection
         if (p & 2) std::memcpy(proj_, m, sizeof m);
@@ -1021,8 +1098,18 @@ void Interpreter::prepare_textures(uint32_t base, bool for_rect) {
             texsrc_->touch(lk.tex);
         } else {
             stats.texture_hashes++;
+            rice_loads_.texture(tile.tmem, &texsrc_->rice_tex);
+            rice_loads_.palette(uses_palette(tile, tlut) ? tile.siz : 3, tile.palette, &texsrc_->rice_pal);  // (siz 3: none)
             st_.tex[t] = texsrc_->get(tmem_, tile, tlut, cyc == CYC_COPY);
             lk.tile = tile; lk.tlut = tlut; lk.gen = tmem_gen_; lk.tex = st_.tex[t];
+#if !defined(__SPU__)
+            if (g_rice_hook && rice_mem_ && st_.tex[t]) {
+                uint32_t crc = 0, pal = 0, hw = 0, hh = 0; bool has_pal = false;
+                const bool ok = rice_key(rice_mem_->rdram, 0x800000, texsrc_->rice_tex, texsrc_->rice_pal, tile, st_.tex[t]->width,
+                                         st_.tex[t]->height, uses_palette(tile, tlut) ? 1 : 0, &crc, &pal, &has_pal, &hw, &hh);
+                g_rice_hook(st_.tex[t], tile, ok, crc, pal, has_pal, hw, hh);
+            }
+#endif
         }
         TexMap& m = st_.tmap[t];
         m.shift_s = shift(tile.shifts); m.shift_t = shift(tile.shiftt);
@@ -1062,6 +1149,13 @@ void Interpreter::prepare_textures(uint32_t base, bool for_rect) {
 
 void Interpreter::note_color_image_drawn() {
     if (!st_.cimg_addr) return;
+#if !defined(__SPU__) && !defined(__PPU__)
+    if (std::getenv("GFX_CIMGLOG")) {
+        static uint32_t last = 0;
+        if (st_.cimg_addr != last) std::printf("[cimg] drawing into 0x%06X (width %u)\n", st_.cimg_addr, st_.cimg_width);
+        last = st_.cimg_addr;
+    }
+#endif
     FbImage* f = nullptr;
     for (uint32_t i = 0; i < fb_count_; i++) if (fb_images_[i].addr == st_.cimg_addr) { f = &fb_images_[i]; break; }
     if (!f) {  // a new one (the oldest gives way when the table is full)
@@ -1123,6 +1217,29 @@ void Interpreter::flush_tris(Backend& be) {
 // times 4:3), so clipping there changes nothing that's seen.
 static constexpr float kGuard = 4.0f;
 
+// Frame interpolation: a triangle's in-between positions where the in-between frame's camera sees
+// them as it should (every w > 0, inside twice the guard band); else (v88: the camera
+// against a wall, half the picture covered by a wall polygon reaching behind the in-between camera,
+// drawn as garbage) the triangle keeps its own frame's positions in the in-between frame. Clipping
+// works on the frame's positions only (both share one triangle list).
+// Twice the guard band, and not the far plane: clipping leaves many vertices exactly on those (a
+// triangle running past the screen's side or into the distance), and their in-between positions just
+// past them were taken for out of sight (v89: 93 water triangles in one list kept their frame's
+// positions, hairline seams in the in-between frames as the camera moved). The RSX draws those fine.
+static inline bool mid_visible(const float* m) {
+    const float w = m[3], gw = 2 * kGuard * w;
+    return w > 1e-5f && m[0] <= gw && m[0] >= -gw && m[1] <= gw && m[1] >= -gw;
+}
+static inline void mid_check(const OutVertex* o, float (*mid)[4]) {
+    if (mid_visible(mid[0]) && mid_visible(mid[1]) && mid_visible(mid[2])) return;
+#if !defined(__SPU__)
+    if (std::getenv("GFX_MIDC"))
+        for (int k = 0; k < 3; k++)
+            N64GFX_LOG("[midc] %d real %.1f %.1f %.1f %.1f  in-between %.1f %.1f %.1f %.1f\n", k, o[k].x, o[k].y, o[k].z, o[k].w, mid[k][0], mid[k][1], mid[k][2], mid[k][3]);
+#endif
+    for (int k = 0; k < 3; k++) { mid[k][0] = o[k].x; mid[k][1] = o[k].y; mid[k][2] = o[k].z; mid[k][3] = o[k].w; }
+}
+
 void Interpreter::triangle(Backend& be, uint32_t a, uint32_t b, uint32_t c) {
     (void)be;
     if (a >= 64 || b >= 64 || c >= 64) return;
@@ -1138,6 +1255,29 @@ void Interpreter::triangle(Backend& be, uint32_t a, uint32_t b, uint32_t c) {
         if ((cull & G_CULL_BACK) && area > 0) return;
         if ((cull & G_CULL_FRONT) && area < 0) return;
     }
+#if !defined(__SPU__)
+    if (debug_blend && interp_ && std::getenv("GFX_MIDW")) {  // triangles reaching behind the in-between camera
+        int bad = 0, okr = 0;
+        for (int k = 0; k < 3; k++) { bad += v[k]->mw <= 1e-5f; okr += v[k]->w > 1e-5f; }
+        if (bad) N64GFX_LOG("[midw] tri real w %.2f %.2f %.2f, in-between w %.2f %.2f %.2f\n", v[0]->w, v[1]->w, v[2]->w, v[0]->mw, v[1]->mw, v[2]->mw);
+        (void)okr;
+    }
+#endif
+#if !defined(__SPU__)
+    if (debug_blend && interp_ && std::getenv("GFX_MIDBIG")) {  // triangles much bigger in the in-between frame
+        float rx0 = 1e9f, rx1 = -1e9f, mx0 = 1e9f, mx1 = -1e9f;
+        bool ok = true;
+        for (int k = 0; k < 3; k++) {
+            if (v[k]->w <= 1e-5f || v[k]->mw <= 1e-5f) { ok = false; break; }
+            const float rx = v[k]->x / v[k]->w, mx = v[k]->mx / v[k]->mw;
+            rx0 = std::min(rx0, rx); rx1 = std::max(rx1, rx); mx0 = std::min(mx0, mx); mx1 = std::max(mx1, mx);
+        }
+        if (ok && mx1 - mx0 > 2 * (rx1 - rx0) + 0.02f && rx0 < 2 && rx1 > -2)
+            N64GFX_LOG("[midbig] verts %u %u %u: real x %.3f..%.3f in-between %.3f..%.3f; group %08x depth %d count %u, ungrouped %u/%u\n", a, b, c, rx0, rx1, mx0, mx1,
+                       group_depth_ ? (unsigned)group_ids_[group_depth_ - 1] : 0u, group_depth_, group_depth_ ? (unsigned)group_counts_[group_depth_ - 1] : 0u,
+                       ungrouped_[1], ungrouped_[0]);
+    }
+#endif
     const bool smooth = (geometry_mode_ & G_SHADING_SMOOTH) != 0;
     // Behind the camera (w > 0) and a guard band (|x|, |y| <= kGuard * w), as the RSP clips: the RSX
     // draws triangles with a vertex behind the camera, or nearly on its plane, as huge garbage polygons.
@@ -1172,6 +1312,7 @@ void Interpreter::triangle(Backend& be, uint32_t a, uint32_t b, uint32_t c) {
     if (interp_)
         for (int k = 0; k < 3; k++) std::memcpy(batch_mid_[batch_n_ - 3 + k], &v[k]->mx, 16);
 #endif
+    if (interp_) mid_check(o, &batch_mid_[batch_n_ - 3]);  // (before the depth clamp below: the positions as they were)
     if (!smooth) { std::memcpy(o[1].c, v[0]->c, 4); std::memcpy(o[2].c, v[0]->c, 4); }  // flat: the first vertex's color
     // Depth closer than the near plane held at the nearest per vertex, as F3DEX2 clamps each vertex's
     // screen Z at 0 (then the RDP interpolates between them).
@@ -1256,18 +1397,56 @@ void Interpreter::clip_triangle(Backend& be, const Vtx* const v[3], bool smooth)
                 mp[0] = p.mx; mp[1] = p.my; mp[2] = p.mz; mp[3] = p.mw;
             }
         }
+        if (interp_) mid_check(o, &batch_mid_[batch_n_]);
         batch_n_ += 3;
         stats.triangles++;
     }
 }
 
 // ------------------------------------------------------------------------------------- RDP
+// Small rather than fast (the SPU's local store is nearly full, and these run once per load or new texture).
+#if defined(__GNUC__) && !defined(__clang__)
+#define N64GFX_SMALL __attribute__((noinline, optimize("Os")))
+#else
+#define N64GFX_SMALL
+#endif
+N64GFX_SMALL void RiceLoads::note(const RiceLoad& r) {
+    if (r.type == RiceLoad::Tlut) { if (r.tmem >= 256) pal[((r.tmem - 256) >> 4) & (kPal - 1)] = r; return; }
+    for (uint32_t i = 0; i < kTex; i++) if (tex[i].type != RiceLoad::None && tex[i].tmem == r.tmem) { tex[i] = r; return; }
+    tex[next] = r; next = (next + 1) & (kTex - 1);
+}
+N64GFX_SMALL void RiceLoads::texture(uint32_t tmem, RiceLoad* out) const {
+    for (uint32_t i = 0; i < kTex; i++) if (tex[i].type != RiceLoad::None && tex[i].tmem == tmem) { *out = tex[i]; return; }
+    *out = RiceLoad{};
+}
+N64GFX_SMALL void RiceLoads::palette(uint32_t siz, uint32_t pal_index, RiceLoad* out) const {
+    const uint32_t tmem = 256 + (siz == 0 ? (pal_index << 4) : 0);
+    const RiceLoad& r = pal[((tmem - 256) >> 4) & (kPal - 1)];
+    if (r.type == RiceLoad::Tlut && r.tmem == tmem) *out = r; else *out = RiceLoad{};
+}
+
+N64GFX_SMALL void Interpreter::note_rice_load(uint8_t type, const Tile& t, uint32_t uls, uint32_t ult, uint32_t lrs, uint32_t lrt) {
+    RiceLoad r;
+    r.type = type; r.siz = (uint8_t)t.siz; r.masks = (uint8_t)t.masks; r.maskt = (uint8_t)t.maskt;
+    r.uls = (uint16_t)uls; r.ult = (uint16_t)ult; r.lrs = (uint16_t)lrs; r.lrt = (uint16_t)lrt;
+    r.addr = timg_.addr; r.width = (uint16_t)timg_.width; r.tsiz = (uint8_t)timg_.siz; r.tmem = (uint16_t)t.tmem;
+    rice_loads_.note(r);
+}
+
 void Interpreter::load_block(const Memory& mem, uint32_t w0, uint32_t w1) {
+#if !defined(__SPU__) && !defined(__PPU__)
+    if (std::getenv("GFX_LOADLOG") && (timg_.width >= 256 || (timg_.addr >= 0x200000 && timg_.addr < 0x400000)))
+        std::printf("[load] %s from 0x%06X (width %u siz %u) while drawing into 0x%06X\n", "block", timg_.addr, timg_.width, timg_.siz, st_.cimg_addr);
+#endif
     tmem_gen_++;
     uint32_t tile = bits(w1, 24, 3);
     uint32_t uls = bits(w0, 12, 12), ult = bits(w0, 0, 12);
     uint32_t lrs = bits(w1, 12, 12), dxt = bits(w1, 0, 12);
     Tile& t = tiles_[tile];
+    note_rice_load(RiceLoad::Block, t, uls, ult, lrs, dxt);
+#if !defined(__SPU__) && !defined(__PPU__)
+    if (std::getenv("GFX_TILELOG")) std::printf("[load] block tile %u tmem %u line %u uls %u ult %u lrs %u dxt %u img %06X w %u siz %u\n", tile, t.tmem, t.line, uls, ult, lrs, dxt, timg_.addr, timg_.width, timg_.siz);
+#endif
     t.uls = uls << 2; t.ult = ult << 2; t.lrs = lrs << 2; t.lrt = ult << 2;  // tile size as the RDP leaves it
     if (lrs < uls) return;
     uint32_t texels = std::min<uint32_t>(lrs - uls + 1, 4096);  // TMEM holds at most 4 KB
@@ -1369,10 +1548,18 @@ void Interpreter::load_block(const Memory& mem, uint32_t w0, uint32_t w1) {
 }
 
 void Interpreter::load_tile(const Memory& mem, uint32_t w0, uint32_t w1) {
+#if !defined(__SPU__) && !defined(__PPU__)
+    if (std::getenv("GFX_LOADLOG") && (timg_.width >= 256 || (timg_.addr >= 0x200000 && timg_.addr < 0x400000)))
+        std::printf("[load] %s from 0x%06X (width %u siz %u) while drawing into 0x%06X\n", "tile", timg_.addr, timg_.width, timg_.siz, st_.cimg_addr);
+#endif
     tmem_gen_++;
     uint32_t tile = bits(w1, 24, 3);
     Tile& t = tiles_[tile];
     t.uls = bits(w0, 12, 12); t.ult = bits(w0, 0, 12); t.lrs = bits(w1, 12, 12); t.lrt = bits(w1, 0, 12);
+    note_rice_load(RiceLoad::TileLoad, t, t.uls, t.ult, t.lrs, t.lrt);
+#if !defined(__SPU__) && !defined(__PPU__)
+    if (std::getenv("GFX_TILELOG")) std::printf("[load] tile %u tmem %u line %u s %u-%u t %u-%u img %06X w %u siz %u\n", tile, t.tmem, t.line, t.uls, t.lrs, t.ult, t.lrt, timg_.addr, timg_.width, timg_.siz);
+#endif
     uint32_t uls = t.uls >> 2, ult = t.ult >> 2, lrs = t.lrs >> 2, lrt = t.lrt >> 2;
     if (lrs < uls || lrt < ult) return;
     uint32_t siz = timg_.siz;
@@ -1455,6 +1642,10 @@ void Interpreter::load_tlut(const Memory& mem, uint32_t w0, uint32_t w1) {
     tmem_gen_++;
     uint32_t tile = bits(w1, 24, 3);
     Tile& t = tiles_[tile];
+    note_rice_load(RiceLoad::Tlut, t, bits(w0, 12, 12), bits(w0, 0, 12), bits(w1, 12, 12), bits(w1, 0, 12));
+#if !defined(__SPU__) && !defined(__PPU__)
+    if (std::getenv("GFX_TILELOG")) std::printf("[load] tlut tile %u tmem %u s %u-%u img %06X\n", tile, t.tmem, bits(w0, 12, 12) >> 2, bits(w1, 12, 12) >> 2, timg_.addr);
+#endif
     uint32_t uls = bits(w0, 12, 12) >> 2, lrs = bits(w1, 12, 12) >> 2;
     uint32_t count = lrs >= uls ? lrs - uls + 1 : 0;
     uint32_t src = timg_.addr + uls * 2;
@@ -1548,6 +1739,9 @@ void (*g_cmd_hook)(uint32_t pc, uint32_t w0, uint32_t w1, const uint8_t* tmem, i
 #endif
 
 void Interpreter::run(const Memory& mem, uint32_t dl_addr, Backend& be) {
+#if !defined(__SPU__)
+    rice_mem_ = &mem;
+#endif
     stats.dls++;
     cbfd_.advanced = false;  // each graphics task starts in the basic lighting mode (as RT64's reset)
     ex_gbi_ = false;         // RT64's extended GBI is enabled per display list
@@ -1561,6 +1755,7 @@ void Interpreter::run(const Memory& mem, uint32_t dl_addr, Backend& be) {
         mvp_dirty_ = true;
         group_depth_ = 0;
         ungrouped_[0] = ungrouped_[1] = 0;
+        proj_match_ = 0;
     }
     const uint64_t t0 = ticks();
     for (auto& lk : lookup_) lk.tex = nullptr;  // the texture cache may have dropped images since

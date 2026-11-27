@@ -17,6 +17,7 @@ extern u32 display_aspect;
 extern u32 curr_fb;
 
 void setRenderTarget(u32 index);
+void setRenderTargetEye(u32 index,int eye);  // 3D: 0 the left eye's lines, 1 the right eye's
 void init_screen(void *host_addr,u32 size);
 // Flips that reached the screen: their times (the timebase), the last kFlipRing of them.
 #define kFlipRing 1024
@@ -25,7 +26,13 @@ extern volatile u32 g_flip_count;
 
 void waitflip();
 void flip();
+void flip_queue();        // flip without the RSX waiting for it there (the renderer's presents)
+void settle_flip_wait();  // the RSX waits for the last flip_queue()'s flip (before drawing to a display buffer)
+int flip_pending();       // a flip queued and not yet on screen
 void clear_screen(u32 xrgb);
+extern int stereo_on;            // 3D (720p frame packing): display_width x display_height is one eye's picture; the renderer draws each
+int stereo_set(int on);          // switch the video mode (between the menu and the game); 0: done
+void stereo_leave_for_exit();    // back to 2D (the video mode only) before the process ends
 extern u32 *color_buffer[2];
 // The IO-mapped main memory given to init_screen (the system's command buffer uses its first 1 MB).
 extern void *host_mem;

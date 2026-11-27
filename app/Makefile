@@ -12,11 +12,11 @@ UP        := $(ROOT)/upstream/CBFD-Recompiled
 RT        := $(UP)/tools/N64ModernRuntime
 
 # RELEASE=1: the release build ("Conker's Bad Fur Day" on the XMB, its own app): no testing or logs,
-# its own data folder, the menu without the unfinished settings, the XMB icon made from the player's
+# its own data folder, the full settings menu (no R3 captures, L3 or logs), the XMB icon made from the player's
 # ROM (stand-in in the package: tools/release/mark_icon.py; or release/ICON0.local.png if you made one,
 # not in the repository).
 # PROFILE=1: the profiler build (instrumented game code, separate app on the XMB).
-VERSION   := 1.2
+VERSION   := 2.0
 ifeq ($(RELEASE),1)
 TARGET    := conker_bfd
 BUILD     := build-release

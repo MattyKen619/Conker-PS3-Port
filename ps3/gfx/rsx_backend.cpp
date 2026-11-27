@@ -57,6 +57,18 @@ bool RsxBackend::init(gcmContextData* ctx, uint32_t scale) {
     if (!stats.vram_mb) { last_error = "no RSX memory for the arena"; return false; }
     alloc_scratch();
     std::printf("[gfx] RSX memory arena: %u MB\n", stats.vram_mb);
+    // The RDP's dither patterns (angrylion's magic_matrix and bayer_matrix), side by side: 8 x 4 texels,
+    // each the pattern's value 0..7 in all four channels (texture 2 of the "like the N64" look).
+    if (uint8_t* d = (uint8_t*)vram_.alloc(64 * 4, 128)) {
+        static const uint8_t magic[16] = {0, 6, 1, 7, 4, 2, 5, 3, 3, 5, 2, 4, 7, 1, 6, 0};
+        static const uint8_t bayer[16] = {0, 4, 1, 5, 4, 0, 5, 1, 3, 7, 2, 6, 7, 3, 6, 2};
+        for (int y = 0; y < 4; y++)
+            for (int x = 0; x < 8; x++) {
+                const uint8_t v = x < 4 ? magic[y * 4 + x] : bayer[y * 4 + x - 4];
+                for (int c = 0; c < 4; c++) d[y * 64 + x * 4 + c] = v;
+            }
+        rsxAddressToOffset(d, &dither_off_);
+    }
     {
         u32 b = 0, e = 0, c = 0;
         rsxAddressToOffset((void*)ctx_->begin, &b); rsxAddressToOffset((void*)ctx_->end, &e); rsxAddressToOffset((void*)ctx_->current, &c);
@@ -271,16 +283,18 @@ RsxBackend::Target* RsxBackend::bind_target(const DrawState& st) {
         nt.xoff = nt.margin * scale_;
         nt.w = (nt.width_n64 + 2 * nt.margin) * scale_;
         nt.h = nt.height_n64 * scale_;
-        nt.pitch = align_up(nt.w * 4, 64);
-        nt.depth_pitch = align_up(nt.w * 4, 64);
+        aa_layout(&nt.aa, &nt.sx, &nt.sy);
+        nt.eyes = (stereo_on && nt.width_n64 >= 256) ? 2 : 1;
+        nt.pitch = align_up(nt.w * nt.sx * 4, 64);
+        nt.depth_pitch = nt.pitch;
         phase = "allocating a render target";
-        nt.color = vram_.alloc(nt.pitch * nt.h, 4096);
+        nt.color = alloc_surface(nt.w * nt.sx * 4, nt.h * nt.sy * nt.eyes, &nt.pitch);
         // The depth buffer: one for all targets of this size (the N64 has one depth image, cleared each
         // frame; frame interpolation's copies are drawn after their frames, with the same clears).
         bool fresh_depth = false;
-        const DepthBuf* d = nt.color ? depth_for(nt.w, nt.h, &fresh_depth) : nullptr;
+        const DepthBuf* d = nt.color ? depth_for(nt.w, nt.h * nt.eyes, nt.sx, nt.sy, &fresh_depth) : nullptr;
         if (!nt.color || !d) {
-            vram_.free(nt.color);
+            free_vram(nt.color);
             stats.alloc_failures++;
             last_error = "no RSX memory for a render target";
             return nullptr;
@@ -294,7 +308,7 @@ RsxBackend::Target* RsxBackend::bind_target(const DrawState& st) {
         bind_surface(t);
         rsxSetClearColor(ctx_, 0);
         rsxSetClearDepthStencil(ctx_, 0xffffff00);
-        rsxSetScissor(ctx_, 0, 0, t->w, t->h);
+        rsxSetScissor(ctx_, 0, 0, t->w, t->h * t->eyes);
         cache_.sc[0] = -1;
         rsxClearSurface(ctx_, GCM_CLEAR_R | GCM_CLEAR_G | GCM_CLEAR_B | GCM_CLEAR_A | (fresh_depth ? GCM_CLEAR_Z | GCM_CLEAR_S : 0));
     } else {
@@ -306,7 +320,7 @@ RsxBackend::Target* RsxBackend::bind_target(const DrawState& st) {
         auto pc = pending_depth_clear_.find(st.zimg_addr);
         if (pc != pending_depth_clear_.end() && st.z_buffered()) {
             rsxSetClearDepthStencil(ctx_, 0xffffff00);
-            rsxSetScissor(ctx_, 0, 0, t->w, t->h);
+            rsxSetScissor(ctx_, 0, 0, t->w, t->h * t->eyes);
             cache_.sc[0] = -1;
             rsxClearSurface(ctx_, GCM_CLEAR_Z | GCM_CLEAR_S);
             pending_depth_clear_.erase(pc);
@@ -370,13 +384,14 @@ void RsxBackend::bind_surface(Target* t) {
     sf.depthOffset = t->depth_off;
     sf.depthPitch = t->depth_pitch;
     sf.type = GCM_SURFACE_TYPE_LINEAR;
-    sf.antiAlias = GCM_SURFACE_CENTER_1;
+    sf.antiAlias = t->aa;
     sf.width = (u16)t->w;
-    sf.height = (u16)t->h;
+    sf.height = (u16)(t->h * t->eyes);
     sf.x = 0;
     sf.y = 0;
     rsxSetSurface(ctx_, &sf);
-    for (u8 i = 0; i < 8; i++) rsxSetViewportClip(ctx_, i, (u16)t->w, (u16)t->h);
+    rsxSetAntialiasingControl(ctx_, t->aa ? GCM_TRUE : GCM_FALSE, GCM_FALSE, GCM_FALSE, 0xFFFF);
+    for (u8 i = 0; i < 8; i++) rsxSetViewportClip(ctx_, i, (u16)t->w, (u16)(t->h * t->eyes));
     rsxSetZMinMaxControl(ctx_, GCM_FALSE, GCM_TRUE, GCM_FALSE);
     rsxSetColorMask(ctx_, GCM_COLOR_MASK_B | GCM_COLOR_MASK_G | GCM_COLOR_MASK_R | GCM_COLOR_MASK_A);
     rsxSetColorMaskMrt(ctx_, 0);
@@ -463,6 +478,7 @@ void RsxBackend::set_blend_depth(const DrawState& st, bool rect, bool fill) {
 }
 
 bool RsxBackend::copy_frame_pieces(const DrawState& st, uint32_t tex_mask) {
+    fb_right_[0] = fb_right_[1] = 0;
     bool any = false;
     for (int u = 0; u < 2; u++) any |= st.tex[u] && st.tex[u]->fb_addr && (tex_mask & (1u << u));
     if (!any) return true;
@@ -470,11 +486,14 @@ bool RsxBackend::copy_frame_pieces(const DrawState& st, uint32_t tex_mask) {
     for (int u = 0; u < 2; u++) {
         const Texture* tex = st.tex[u];
         if (!tex || !tex->fb_addr || !(tex_mask & (1u << u))) continue;
-        // In frame interpolation's pass, an image drawn in it is read from its in-between copy.
+        // In frame interpolation's pass, an image drawn in it is read from its in-between copy, unless
+        // the image was drawn since (v90: the pause menu's background, an image drawn when Start was
+        // pressed, in a list without an in-between pass (a camera cut); its in-between copy from long
+        // before (never shown, so still "ready") gave every in-between frame a scene from elsewhere).
         auto it = targets_.find(tex->fb_addr);
         if (mid_) {
             auto m = mid_targets_.find(tex->fb_addr);
-            if (m != mid_targets_.end() && m->second.mid_ready) it = m;
+            if (m != mid_targets_.end() && m->second.mid_ready && (it == targets_.end() || m->second.drawn_dl >= it->second.drawn_dl)) it = m;
         }
         if (it == targets_.end()) { stats.fb_missing++; return false; }
         Target& f = it->second;
@@ -491,9 +510,14 @@ bool RsxBackend::copy_frame_pieces(const DrawState& st, uint32_t tex_mask) {
         c.pitch = align_up(c.w * 4, 64);
         const uint32_t bytes = align_up(c.pitch * c.h, 128);
         const uint32_t half = scratch_size_ / 2;
-        if (c.w == 0 || c.h == 0 || c.w > 4096 || c.h > 4096 || scratch_pos_ + bytes > half) { stats.fb_missing++; return false; }
+        // 3D: a two-eye picture's piece is copied from each eye (the right eye's draws read theirs).
+        const int eyes = f.eyes == 2 ? 2 : 1;
+        if (c.w == 0 || c.h == 0 || c.w > 4096 || c.h > 4096 || scratch_pos_ + bytes * eyes > half) { stats.fb_missing++; return false; }
         c.off = scratch_off_ + scratch_half_ * half + scratch_pos_;
         scratch_pos_ += bytes;
+        c.off_r = 0;
+        if (eyes == 2) { c.off_r = scratch_off_ + scratch_half_ * half + scratch_pos_; scratch_pos_ += bytes; }
+        for (int eye = 0; eye < eyes; eye++) {
         stats.scratch_max_kb = std::max(stats.scratch_max_kb, scratch_pos_ / 1024);
         // Render into the scratch piece: a quad sampling the frame's target.
         ensure_cmd_space();
@@ -503,7 +527,7 @@ bool RsxBackend::copy_frame_pieces(const DrawState& st, uint32_t tex_mask) {
         sf.colorFormat = GCM_SURFACE_A8R8G8B8;
         sf.colorTarget = GCM_SURFACE_TARGET_0;
         sf.colorLocation[0] = GCM_LOCATION_RSX;
-        sf.colorOffset[0] = c.off;
+        sf.colorOffset[0] = eye ? c.off_r : c.off;
         sf.colorPitch[0] = c.pitch;
         for (int i = 1; i < 4; i++) { sf.colorLocation[i] = GCM_LOCATION_RSX; sf.colorOffset[i] = 0; sf.colorPitch[i] = 64; }
         sf.depthFormat = GCM_SURFACE_ZETA_Z24S8;  // not used (depth off), but the surface needs one
@@ -515,6 +539,7 @@ bool RsxBackend::copy_frame_pieces(const DrawState& st, uint32_t tex_mask) {
         sf.width = (u16)c.w;
         sf.height = (u16)c.h;
         rsxSetSurface(ctx_, &sf);
+        rsxSetAntialiasingControl(ctx_, GCM_FALSE, GCM_FALSE, GCM_FALSE, 0xFFFF);
         bound_ = nullptr;
         for (u8 i = 0; i < 8; i++) rsxSetViewportClip(ctx_, i, (u16)c.w, (u16)c.h);
         rsxSetColorMask(ctx_, GCM_COLOR_MASK_B | GCM_COLOR_MASK_G | GCM_COLOR_MASK_R | GCM_COLOR_MASK_A);
@@ -550,12 +575,12 @@ bool RsxBackend::copy_frame_pieces(const DrawState& st, uint32_t tex_mask) {
                     ((intensity ? rc : GCM_TEXTURE_REMAP_COLOR_G) << GCM_TEXTURE_REMAP_COLOR_G_SHIFT) |
                     (GCM_TEXTURE_REMAP_COLOR_R << GCM_TEXTURE_REMAP_COLOR_R_SHIFT) |
                     ((intensity ? rc : GCM_TEXTURE_REMAP_COLOR_A) << GCM_TEXTURE_REMAP_COLOR_A_SHIFT));
-        tx.width = (u16)f.w;
-        tx.height = (u16)f.h;
+        tx.width = (u16)(f.w * f.sx);  // multisampled: all the samples (the coordinates are 0..1)
+        tx.height = (u16)(f.h * f.sy);
         tx.depth = 1;
         tx.location = GCM_LOCATION_RSX;
         tx.pitch = f.pitch;
-        tx.offset = f.color_off;
+        tx.offset = f.color_off + (eye ? f.h * f.sy * f.pitch : 0);  // the right eye's picture: below the left's
         rsxInvalidateTextureCache(ctx_, GCM_INVALIDATE_TEXTURE);  // the frame may have just been drawn
         rsxLoadTexture(ctx_, 0, &tx);
         rsxTextureControl(ctx_, 0, GCM_TRUE, 0 << 8, 12 << 8, GCM_TEXTURE_MAX_ANISO_1);
@@ -587,6 +612,7 @@ bool RsxBackend::copy_frame_pieces(const DrawState& st, uint32_t tex_mask) {
         const bool vp = cache_.vp_loaded;
         cache_ = StateCache{};
         cache_.vp_loaded = vp;
+        }
     }
     rsxInvalidateTextureCache(ctx_, GCM_INVALIDATE_TEXTURE);  // the pieces were just drawn
     return true;
@@ -599,6 +625,7 @@ bool RsxBackend::copy_frame_pieces(const DrawState& st, uint32_t tex_mask) {
 void RsxBackend::reset_state() {
     cache_ = StateCache{};  // the vertex program too
     vpc_valid_ = false;
+    c8_valid_ = false;
     bound_program_ = nullptr;
     bound_ = nullptr;
     rsxSetAlphaTestEnable(ctx_, GCM_FALSE);
@@ -615,6 +642,29 @@ void RsxBackend::reset_state() {
     rsxSetFrontFace(ctx_, GCM_FRONTFACE_CCW);
     rsxSetPolygonSmoothEnable(ctx_, GCM_FALSE);
     rsxSetRestartIndexEnable(ctx_, GCM_FALSE);
+    // Texture 2: the dither patterns (the "like the N64" look's programs read it).
+    if (dither_off_) {
+        gcmTexture tx;
+        std::memset(&tx, 0, sizeof tx);
+        tx.format = GCM_TEXTURE_FORMAT_A8R8G8B8 | GCM_TEXTURE_FORMAT_LIN;
+        tx.mipmap = 1;
+        tx.dimension = GCM_TEXTURE_DIMS_2D;
+        tx.cubemap = GCM_FALSE;
+        tx.remap = ((GCM_TEXTURE_REMAP_TYPE_REMAP << GCM_TEXTURE_REMAP_TYPE_B_SHIFT) | (GCM_TEXTURE_REMAP_TYPE_REMAP << GCM_TEXTURE_REMAP_TYPE_G_SHIFT) |
+                    (GCM_TEXTURE_REMAP_TYPE_REMAP << GCM_TEXTURE_REMAP_TYPE_R_SHIFT) | (GCM_TEXTURE_REMAP_TYPE_REMAP << GCM_TEXTURE_REMAP_TYPE_A_SHIFT) |
+                    (GCM_TEXTURE_REMAP_COLOR_B << GCM_TEXTURE_REMAP_COLOR_B_SHIFT) | (GCM_TEXTURE_REMAP_COLOR_G << GCM_TEXTURE_REMAP_COLOR_G_SHIFT) |
+                    (GCM_TEXTURE_REMAP_COLOR_R << GCM_TEXTURE_REMAP_COLOR_R_SHIFT) | (GCM_TEXTURE_REMAP_COLOR_A << GCM_TEXTURE_REMAP_COLOR_A_SHIFT));
+        tx.width = 8;
+        tx.height = 4;
+        tx.depth = 1;
+        tx.location = GCM_LOCATION_RSX;
+        tx.pitch = 64;
+        tx.offset = dither_off_;
+        rsxLoadTexture(ctx_, 2, &tx);
+        rsxTextureControl(ctx_, 2, GCM_TRUE, 0 << 8, 0, GCM_TEXTURE_MAX_ANISO_1);
+        rsxTextureFilter(ctx_, 2, 0, GCM_TEXTURE_NEAREST, GCM_TEXTURE_NEAREST, GCM_TEXTURE_CONVOLUTION_QUINCUNX);
+        rsxTextureWrapMode(ctx_, 2, GCM_TEXTURE_CLAMP_TO_EDGE, GCM_TEXTURE_CLAMP_TO_EDGE, GCM_TEXTURE_CLAMP_TO_EDGE, 0, GCM_TEXTURE_ZFUNC_LESS, 0);
+    }
     rsxSetFrequencyDividerOperation(ctx_, 0);
     rsxSetFragmentProgramGammaEnable(ctx_, GCM_FALSE);
     rsxSetPointSpriteControl(ctx_, GCM_FALSE, 0, 0);
@@ -705,6 +755,107 @@ RsxBackend::RsxTex* RsxBackend::mip_texture(const Texture* base, const DrawState
     return rt;
 }
 
+// A texture pack's picture, as TexturePack::prepare left it: swizzled with its mipmaps (the pack's
+// pictures are 2 or 4 times the N64's size: without mipmaps they shimmer far away), or its rows (sides
+// that aren't powers of two: such textures are clamped, and the RSX only repeats and mipmaps powers of two).
+RsxBackend::RsxTex* RsxBackend::hd_texture(const TexturePack::Ready& r) {
+    if (r.data.empty()) return nullptr;
+    phase = "uploading a texture pack's texture";
+    struct Add { uint64_t& to; uint64_t t0; ~Add() { to += __mftb() - t0; } } add{stats.t_upload, __mftb()};
+    RsxTex* rt = new RsxTex();
+    rt->dxt = r.dxt;
+    if (r.swizzled || r.dxt) {
+        rt->mem = vram_.alloc(r.data.size(), 128);
+        if (!rt->mem) { delete rt; return nullptr; }
+        std::memcpy(rt->mem, r.data.data(), r.data.size());
+        rt->pitch = 0;
+        rt->levels = r.levels;
+    } else {
+        rt->pitch = align_up(r.w * 4, 64);
+        rt->mem = vram_.alloc(rt->pitch * r.h, 128);
+        if (!rt->mem) { delete rt; return nullptr; }
+        for (uint32_t y = 0; y < r.h; y++) std::memcpy((uint8_t*)rt->mem + (size_t)y * rt->pitch, &r.data[(size_t)y * r.w * 4], (size_t)r.w * 4);
+    }
+    rsxAddressToOffset(rt->mem, &rt->off);
+    stats.textures_uploaded++;
+    stats.hd_textures++;
+    rsxInvalidateTextureCache(ctx_, GCM_INVALIDATE_TEXTURE);
+    return rt;
+}
+
+// A picture's own key: which pack picture, at what size, cut how. The pictures are kept by this, not by
+// the game texture's hash (v72): one picture showed up under 3 to 5 texture hashes in a still scene (the
+// castle's 256-colour walls), each prepared again and the game's own drawn meanwhile (blurry, sharp).
+uint64_t RsxBackend::hd_key(const TexturePack::Job& j) {
+    uint64_t k = j.offset * 0x9E3779B97F4A7C15ull;
+    for (uint64_t v : {(uint64_t)j.w << 32 | j.h, (uint64_t)j.cover_w << 32 | j.cover_h, (uint64_t)j.alpha}) {
+        k ^= v + 0x9E3779B97F4A7C15ull + (k << 6) + (k >> 2);
+    }
+    return k;
+}
+
+void RsxBackend::want_hd(uint64_t hash, const TexturePack::Job& job) {
+    if (!pack) return;
+    if (hd_jobs_.size() > 20000) hd_jobs_.clear();  // (only a bound: entries go with their textures)
+    hd_jobs_[hash] = job;
+    const uint64_t key = hd_key(job);
+    if (hd_.count(key) || hd_pending_.count(key)) return;
+    hd_pending_.insert(key);
+    pack->request(key, job, mips_ok_, dxt_ok_);
+}
+
+// How much of the RSX's memory the pictures may take: what everything else leaves, less a reserve for a
+// higher resolution's targets. Memory waiting to be freed (the RSX may still read it) counts as free:
+// v68 counted it as used by something else, so each picture freed for room made the room smaller and
+// freed another, about 2,000 at once, which then all came back (the flicker).
+size_t RsxBackend::hd_budget() const {
+    size_t freeing = 0;
+    for (const auto& f : free_queue_) freeing += vram_.size_of(f.second->mem);
+    const size_t used = vram_.in_use() > freeing ? vram_.in_use() - freeing : 0;
+    const size_t other = used > hd_bytes_ ? used - hd_bytes_ : 0, reserve = 32u << 20;
+    const size_t room = vram_.size() > other + reserve ? vram_.size() - other - reserve : 0;
+    return room < (48u << 20) ? (48u << 20) : room > (144u << 20) ? (144u << 20) : room;
+}
+
+// Frees the pictures unused longest until need more bytes fit in the budget (none used in the last
+// seconds: they may be on the screen).
+void RsxBackend::evict_hd(size_t need) {
+    const size_t budget = hd_budget();
+    while (hd_bytes_ + need > budget) {
+        auto oldest = hd_.end();
+        for (auto it = hd_.begin(); it != hd_.end(); ++it)
+            if (dl_seq_ - it->second.last_used > 150 && (oldest == hd_.end() || it->second.last_used < oldest->second.last_used)) oldest = it;
+        if (oldest == hd_.end()) return;
+        free_queue_.push_back({dl_seq_, oldest->second.rt});
+        hd_bytes_ -= oldest->second.bytes;
+        hd_.erase(oldest);
+        stats.hd_evicted++;
+    }
+}
+
+// Uploads what the background thread has ready: a few a display list, so a level's worth arriving
+// together doesn't hold a frame up.
+void RsxBackend::take_hd() {
+    if (!pack) return;
+    for (int n = 0; n < 3; n++) {
+        uint64_t hash;
+        TexturePack::Ready ready;
+        if (!pack->take_any(&hash, &ready)) return;
+        hd_pending_.erase(hash);
+        if (ready.data.empty()) continue;  // couldn't be read
+        const size_t bytes = ready.swizzled || ready.dxt ? ready.data.size() : (size_t)align_up(ready.w * 4, 64) * ready.h;
+        evict_hd(bytes);
+        // No room (everything here was drawn in the last seconds): the game's own stays, and the picture
+        // is asked for again in a while if the texture is still being drawn.
+        RsxTex* rt = hd_bytes_ + bytes > hd_budget() + (8u << 20) ? nullptr : hd_texture(ready);
+        if (!rt) { hd_failed_[hash] = dl_seq_; continue; }
+        hd_failed_.erase(hash);
+        HdTex& e = hd_[hash];
+        e.rt = rt; e.last_used = dl_seq_; e.bytes = (uint32_t)bytes; e.w = (uint16_t)ready.w; e.h = (uint16_t)ready.h;
+        hd_bytes_ += bytes;
+    }
+}
+
 void RsxBackend::evict_mips() {  // the ones unused for a while (their memory is freed once the RSX is past them)
     for (auto it = mips_.begin(); it != mips_.end();) {
         if (dl_seq_ - it->second.last_used > 300) {
@@ -723,7 +874,34 @@ bool RsxBackend::bind_texture(int unit, const Texture* tex, const TexMap& map, b
     RsxTex* rt = (RsxTex*)tex->backend_data;
     uint32_t levels = 1;
     if (unit == 0) last_mip_levels_ = 0;
-    if (mips && mips->mip_levels && unit == 0 && !tex->fb_addr && mips_ok_ && mip_variant != 4) {
+    // A texture pack's picture, if it's here (take_hd): its own size and mipmaps. Until then, and if it
+    // can't be had, the game's own texture is drawn.
+    // By the texture's hash alone, whatever its decode found (v71): the pack's key is worked out when the
+    // texture is decoded, from the loads noted just before (RiceLoads, the last 8), and a texture decoded
+    // again long after its load (the game drawing from TMEM it loaded earlier) gets no key: it was drawn
+    // as the game's own until the next decode found it (switching blurry and sharp).
+    const HdTex* hdt = nullptr;
+    auto j = tex->fb_addr || hd_jobs_.empty() ? hd_jobs_.end() : hd_jobs_.find(tex->hash);
+    if (j != hd_jobs_.end()) {
+        const uint64_t key = hd_key(j->second);
+        auto it = hd_.find(key);
+        if (it != hd_.end()) {
+            it->second.last_used = dl_seq_; hdt = &it->second; rt = hdt->rt;
+            if (!tex->hd_state) stats.hd_without_key++;
+        } else if (pack && !hd_pending_.count(key)) {
+            // Its picture was freed for room (or didn't fit) and the texture is drawn again: asked for again.
+            auto f = hd_failed_.find(key);
+            if (f == hd_failed_.end() || dl_seq_ - f->second > 300) {
+                hd_pending_.insert(key);
+                pack->request(key, j->second, mips_ok_, dxt_ok_);
+            }
+        }
+    }
+    const bool hd = hdt != nullptr;
+    if (hd) {
+        levels = rt->levels;
+        crop = nullptr;
+    } else if (mips && mips->mip_levels && unit == 0 && !tex->fb_addr && mips_ok_ && mip_variant != 4) {
         if (RsxTex* m = mip_texture(tex, *mips)) { rt = m; levels = 1 + mips->mip_levels; stats.mip_draws++; last_mip_levels_ = levels; }
     }
     if (tex->fb_addr) {  // copied by copy_frame_pieces: 2x the texture's size
@@ -752,6 +930,7 @@ bool RsxBackend::bind_texture(int unit, const Texture* tex, const TexMap& map, b
     gcmTexture tx;
     std::memset(&tx, 0, sizeof tx);
     tx.format = levels > 1 ? GCM_TEXTURE_FORMAT_A8R8G8B8 : GCM_TEXTURE_FORMAT_A8R8G8B8 | GCM_TEXTURE_FORMAT_LIN;
+    if (rt->dxt) tx.format = rt->dxt == 1 ? 0x86 : 0x88;  // CELL_GCM_TEXTURE_COMPRESSED_DXT1 / DXT45 (power-of-two sides)
     tx.mipmap = (u8)levels;
     tx.dimension = GCM_TEXTURE_DIMS_2D;
     tx.cubemap = GCM_FALSE;
@@ -765,6 +944,7 @@ bool RsxBackend::bind_texture(int unit, const Texture* tex, const TexMap& map, b
                 (GCM_TEXTURE_REMAP_COLOR_A << GCM_TEXTURE_REMAP_COLOR_A_SHIFT));
     // A frame piece's copy is twice the size (the render scale); coordinates stay in N64 texels.
     uint32_t tw = tex->fb_addr ? fb_copy_[unit & 1].w : tex->width, th = tex->fb_addr ? fb_copy_[unit & 1].h : tex->height;
+    if (hd) { tw = hdt->w; th = hdt->h; }
     uint32_t crop_off = 0, crop_y0 = 0;
     const bool cropped = crop && !tex->fb_addr && levels == 1 && crop[0] >= 1 && crop[0] <= tw && crop[2] > crop[1] && crop[2] <= th &&
                          (crop[1] * rt->pitch) % 128 == 0 && (crop[0] < tw || crop[1] > 0 || crop[2] < th);
@@ -775,12 +955,12 @@ bool RsxBackend::bind_texture(int unit, const Texture* tex, const TexMap& map, b
     tx.location = GCM_LOCATION_RSX;
     tx.pitch = rt->pitch;
     tx.offset = rt->off + crop_off;
-    u8 f = bilinear ? GCM_TEXTURE_LINEAR : GCM_TEXTURE_NEAREST;
+    u8 f = bilinear || hd ? GCM_TEXTURE_LINEAR : GCM_TEXTURE_NEAREST;
     // Mipmapped: blended between the two nearest levels, as the N64's LOD fraction does.
-    u8 fmin = levels > 1 ? (bilinear ? GCM_TEXTURE_LINEAR_MIPMAP_LINEAR : GCM_TEXTURE_NEAREST_MIPMAP_LINEAR) : f;
-    if (levels > 1 && mip_variant == 2) fmin = f;
-    const u16 maxlod = levels > 1 && mip_variant == 1 ? 0 : (u16)((levels - 1) << 8);
-    const u16 bias = levels > 1 && mip_variant == 3 ? (u16)((-4 * 256) & 0x1fff) : 0;
+    u8 fmin = levels > 1 ? (bilinear || hd ? GCM_TEXTURE_LINEAR_MIPMAP_LINEAR : GCM_TEXTURE_NEAREST_MIPMAP_LINEAR) : f;
+    if (levels > 1 && mip_variant == 2 && !hd) fmin = f;
+    const u16 maxlod = levels > 1 && mip_variant == 1 && !hd ? 0 : (u16)((levels - 1) << 8);
+    const u16 bias = levels > 1 && mip_variant == 3 && !hd ? (u16)((-4 * 256) & 0x1fff) : 0;
     auto wrap = [](bool clamp, bool mirror, uint32_t size) -> u8 {
         if (clamp || !pot(size)) return GCM_TEXTURE_CLAMP_TO_EDGE;
         return mirror ? GCM_TEXTURE_MIRRORED_REPEAT : GCM_TEXTURE_REPEAT;
@@ -792,14 +972,20 @@ bool RsxBackend::bind_texture(int unit, const Texture* tex, const TexMap& map, b
     const u8 ws = wrap(cs || cropped, map.mirror_s, tex->width), wt = wrap(ct || cropped, map.mirror_t, tex->height);
     StateCache::Tex& c = cache_.tex[unit & 1];
     if (c.offset != tx.offset || c.w != tw || c.h != th || c.pitch != rt->pitch || c.filter != f ||
-        c.ws != ws || c.wt != wt || c.levels != levels || mip_variant) {
+        c.ws != ws || c.wt != wt || c.levels != levels || c.dxt != rt->dxt || mip_variant) {
         note("  texture %d: %ux%u pitch %u off 0x%X clamp %d/%d mirror %d/%d", unit, tex->width, tex->height, rt->pitch, rt->off,
              map.clamp_s, map.clamp_t, map.mirror_s, map.mirror_t);
         rsxLoadTexture(ctx_, (u8)unit, &tx);
-        rsxTextureControl(ctx_, (u8)unit, GCM_TRUE, 0 << 8, maxlod, GCM_TEXTURE_MAX_ANISO_1);
+        // The clean look: mipmapped textures (the game's and the pack's) sharper on surfaces seen at an
+        // angle (anisotropic filtering, up to 8 samples).
+        rsxTextureControl(ctx_, (u8)unit, GCM_TRUE, 0 << 8, maxlod, levels > 1 && !n64_look ? GCM_TEXTURE_MAX_ANISO_8 : GCM_TEXTURE_MAX_ANISO_1);
         rsxTextureFilter(ctx_, (u8)unit, bias, fmin, f, GCM_TEXTURE_CONVOLUTION_QUINCUNX);
         rsxTextureWrapMode(ctx_, (u8)unit, ws, wt, GCM_TEXTURE_CLAMP_TO_EDGE, 0, GCM_TEXTURE_ZFUNC_LESS, 0);
-        c.offset = tx.offset; c.w = tw; c.h = th; c.pitch = rt->pitch; c.filter = f; c.ws = ws; c.wt = wt; c.levels = (u8)levels;
+        c.offset = tx.offset; c.w = tw; c.h = th; c.pitch = rt->pitch; c.filter = f; c.ws = ws; c.wt = wt; c.levels = (u8)levels; c.dxt = rt->dxt;
+    }
+    if (tex->fb_addr && fb_copy_[unit & 1].off_r) {  // 3D: the right eye's draw reads the right eye's piece
+        fb_right_[unit & 1] = fb_copy_[unit & 1].off_r;
+        fb_tx_[unit & 1] = tx;
     }
     uvscale[0] = 1.0f / tex->width;
     uvscale[1] = 1.0f / tex->height;
@@ -816,7 +1002,7 @@ void RsxBackend::set_consts(const VpConsts& k) {
     if (vpc_valid_ && std::memcmp(&k, &vpc_, sizeof k) == 0) return;
     vpc_ = k;
     vpc_valid_ = true;
-    rsxLoadVertexProgramParameterBlock(ctx_, 0, 7, &k.c[0][0]);  // 7 constants (SetVertexProgramConstants counts floats)
+    rsxLoadVertexProgramParameterBlock(ctx_, 0, kVpConstCount, &k.c[0][0]);  // all of VpConsts
 }
 
 void RsxBackend::identity_consts() {
@@ -835,6 +1021,7 @@ RsxBackend::VpConsts RsxBackend::draw_consts(const DrawState& st, float thr, con
     for (int u = 0; u < 2; u++) {
         if (!have[u]) continue;
         const TexMap& m = st.tmap[u];
+        k.c[7][2 * u] = uvs[u][0]; k.c[7][2 * u + 1] = uvs[u][1];  // a texel, for the 3-point filter
         k.c[u][0] = m.shift_s * uvs[u][0]; k.c[u][1] = (half - m.offset_s + uvo[u][0]) * uvs[u][0];
         k.c[u][2] = m.shift_t * uvs[u][1]; k.c[u][3] = (half - m.offset_t + uvo[u][1]) * uvs[u][1];
     }
@@ -860,12 +1047,40 @@ void RsxBackend::draw(uint32_t offset, uint32_t count, u8 loc, uint32_t pos_offs
         // The draw's constants were set before the program was loaded (setup_*): send them again
         // after it (the first draw after reset_state used to get the identity constants instead:
         // texture coordinates in texels, 32 times too dense for a 32-texel texture).
-        if (vpc_valid_) rsxLoadVertexProgramParameterBlock(ctx_, 0, 7, &vpc_.c[0][0]);
+        // (All of them: v80's sent 7 here, so c[7], the 3-point filter's texel, was missing until the
+        // constants changed: the sky's quads, all alike, drew one colour each.)
+        if (vpc_valid_) rsxLoadVertexProgramParameterBlock(ctx_, 0, kVpConstCount, &vpc_.c[0][0]);
+        c8_valid_ = false;
     }
     if (!vpc_valid_) identity_consts();
     rsxInvalidateVertexCache(ctx_);
     phase = "issuing a draw";
-    rsxDrawVertexArray(ctx_, GCM_TYPE_TRIANGLES, 0, count);
+    if (bound_ && bound_->eyes == 2 && cache_.vp_w == bound_->w && cache_.vp_h == bound_->h) {
+        // 3D: the left eye's picture as set up, then the right eye's, below it: the same viewport and
+        // scissor moved down a picture, and 3D seen from the other side; then the left eye's again. Only
+        // with set_viewport's viewport (the cache holds it).
+        const Target* t = bound_;
+        load_c8(-1.0f, draw_3d_);
+        rsxDrawVertexArray(ctx_, GCM_TYPE_TRIANGLES, 0, count);
+        float s[4] = {cache_.vp[0], cache_.vp[1], cache_.vp[2], 0}, o[4] = {cache_.vp[4], cache_.vp[5] + (float)t->h, cache_.vp[6], 0};
+        rsxSetViewport(ctx_, 0, (u16)t->h, (u16)t->w, (u16)t->h, 0.0f, 1.0f, s, o);
+        if (cache_.sc[0] >= 0) rsxSetScissor(ctx_, (u16)cache_.sc[0], (u16)(cache_.sc[1] + (int)t->h), (u16)cache_.sc[2], (u16)cache_.sc[3]);
+        load_c8(1.0f, draw_3d_);
+        for (u8 u = 0; u < 2; u++)
+            if (fb_right_[u]) { gcmTexture tx = fb_tx_[u]; tx.offset = fb_right_[u]; rsxLoadTexture(ctx_, u, &tx); }
+        rsxDrawVertexArray(ctx_, GCM_TYPE_TRIANGLES, 0, count);
+        for (u8 u = 0; u < 2; u++)
+            if (fb_right_[u]) rsxLoadTexture(ctx_, u, &fb_tx_[u]);
+        // Back on the left eye (v100 left the RSX on the right eye's: the self-test's own draws, which
+        // don't set the viewport, went there).
+        o[1] = cache_.vp[5];
+        rsxSetViewport(ctx_, 0, 0, (u16)t->w, (u16)t->h, 0.0f, 1.0f, s, o);
+        if (cache_.sc[0] >= 0) rsxSetScissor(ctx_, (u16)cache_.sc[0], (u16)cache_.sc[1], (u16)cache_.sc[2], (u16)cache_.sc[3]);
+        stats.draws++;
+    } else {
+        load_c8(0.0f, false);
+        rsxDrawVertexArray(ctx_, GCM_TYPE_TRIANGLES, 0, count);
+    }
     phase = "back in the interpreter";
     stats.draws++;
     stats.vertices += count;
@@ -878,6 +1093,48 @@ void RsxBackend::draw(uint32_t offset, uint32_t count, u8 loc, uint32_t pos_offs
         std::snprintf(what, sizeof what, "draw #%u (%u vertices)", stats.draws, count);
         fence(what);
     }
+}
+
+// The vertex program's c[8]: 3D's shift for one eye (eye_sign -1 the left, 1 the right; shifted: a 3D
+// draw, else at the screen's depth), or nothing (2D).
+void RsxBackend::load_c8(float eye_sign, bool shifted) {
+    float c[4] = {0, 0, 0, 0};
+    if (eye_sign != 0.0f && shifted) {
+        c[0] = stereo_d_;
+        c[1] = -stereo_k_ * stereo_d_;
+        c[2] = -stereo_d_ * stereo_conv_;
+        c[3] = eye_sign;
+    }
+    if (c8_valid_ && std::memcmp(c, c8_, sizeof c) == 0) return;
+    std::memcpy(c8_, c, sizeof c);
+    c8_valid_ = true;
+    rsxLoadVertexProgramParameterBlock(ctx_, 8, 1, c);
+}
+
+// The ghost cancellation's program. A 3D TV lets a little of each eye's picture through to the other eye,
+// as light: so in (about) linear light (the square of the value), each eye's picture less `leak` times the
+// other's, plus `leak` so a black under a bright ghost doesn't go below zero, over 1 + leak to fit; then
+// back (square root). (Texture 0: this eye's picture, 1: the other eye's, at the same place.)
+bool RsxBackend::set_ghost(float leak) {
+    ghost_ = leak;
+    if (leak <= 0 || ghost_off_) return true;
+    char src[1024];
+    std::snprintf(src, sizeof src,
+        "!!ARBfp1.0\n#const c[0] = %.6f %.6f %.6f 0\n#const c[1] = 0.000001 1 0 0\n"
+        "TEX R0, f[TEX0], texture[0], 2D;\nTEX R1, f[TEX0], texture[1], 2D;\n"
+        "MUL R0.xyz, R0, R0;\nMUL R1.xyz, R1, R1;\n"
+        "MAD R0.xyz, R1, c[0].x, R0;\nADD R0.xyz, R0, c[0].y;\nMUL R0.xyz, R0, c[0].z;\n"
+        "MAX R0.xyz, R0, c[1].x;\nRSQ R2.x, R0.x;\nRSQ R2.y, R0.y;\nRSQ R2.z, R0.z;\nMUL R0.xyz, R0, R2;\n"
+        "MOV R0.w, c[1].y;\nMOV result.color, R0;\nEND\n",
+        -leak, leak, 1.0f / (1.0f + leak));
+    if (!fpasm::assemble(src, ghost_blob_)) { std::printf("[gfx] 3D: the ghost cancellation's program didn't assemble\n"); ghost_ = 0; return false; }
+    void* ucode = nullptr; u32 size = 0;
+    rsxFragmentProgramGetUCode((rsxFragmentProgram*)ghost_blob_.data(), &ucode, &size);
+    void* mem = vram_.alloc(size, 128);
+    if (!mem) { ghost_ = 0; return false; }
+    std::memcpy(mem, ucode, size);
+    rsxAddressToOffset(mem, &ghost_off_);
+    return true;
 }
 
 void RsxBackend::draw_vertices(const OutVertex* in, const float (*pos)[4], size_t count) {
@@ -935,13 +1192,49 @@ void RsxBackend::draw_triangles_pos(const DrawState& st, const OutVertex* in, co
     if (setup_triangles(st, count)) draw_vertices(in, pos, count);
 }
 
+// The "like the N64" look: a draw into a 16-bit frame in the 1- or 2-cycle mode is written as the RDP
+// writes it (5 bits a channel, with the dither its other modes choose); fills and copies aren't dithered.
+void RsxBackend::apply_look(ProgramKey& key, const DrawState& st) const {
+    if (!n64_look || !dither_off_ || st.cimg_siz != 2) return;
+    if (key.mode != ProgramMode::Combine1 && key.mode != ProgramMode::Combine2 && key.mode != ProgramMode::Shade) return;
+    const uint32_t cyc = (st.om_h >> 20) & 3;
+    if (cyc >= 2) return;
+    const uint32_t sel = (st.om_h >> 6) & 3;  // G_MDSFT_RGBDITHER: magic square, Bayer, noise (as magic), none
+    key.dither = sel == 3 ? 1 : sel == 1 ? 3 : 2;
+    key.dscale = (uint8_t)scale_;
+}
+
+// The "like the N64" look's texture filter (v80): the textures drawn from the game's own image with
+// bilinear filtering on get the RDP's 3-point filter (the fragment program reads the 3 nearest texels,
+// the texture unit samples nearest); not the pack's pictures, mipmapped draws or frame textures.
+uint8_t RsxBackend::three_point_units(const DrawState& st, uint8_t tex_mask, bool bilinear) const {
+    if (!n64_look || !bilinear || !three_point_ok_) return 0;
+    uint8_t m = 0;
+    for (int u = 0; u < 2; u++) {
+        const Texture* t = st.tex[u];
+        if (!(tex_mask & (1 << u)) || !t || t->fb_addr) continue;
+        if (u == 0 && st.mip_levels && mips_ok_ && mip_variant != 4) continue;
+        if (!hd_jobs_.empty()) {
+            auto j = hd_jobs_.find(t->hash);
+            if (j != hd_jobs_.end() && hd_.count(hd_key(j->second))) continue;
+        }
+        m |= (uint8_t)(1 << u);
+    }
+    return m;
+}
+
 bool RsxBackend::setup_triangles(const DrawState& st, size_t count) {
     ensure_cmd_space();
     phase = "triangles: setup";
     ProgramKey key = make_program_key(st, false);
+    apply_look(key, st);
+    key.three_point = three_point_units(st, key.tex_mask, st.cycle() != CYC_COPY && ((st.om_h >> 12) & 3) >= 2);
+    for (int u = 0; u < 2; u++)
+        if (key.three_point & (1 << u)) { key.tp_w[u] = (uint16_t)st.tex[u]->width; key.tp_h[u] = (uint16_t)st.tex[u]->height; }
     if (!copy_frame_pieces(st, key.tex_mask)) return false;  // a frame we don't have: draw nothing rather than garbage
     Target* t = bind_target(st);
     if (!t) return false;
+    draw_3d_ = true;
     const Program* p = program(key);
     note("triangles (%u vertices) target 0x%06X: program mode %d comb %06X:%08X tex %d atest %d fog %d %s, om %06X:%08X",
          (unsigned)count, st.cimg_addr, (int)key.mode, key.combine_hi, key.combine_lo, key.tex_mask, key.alpha_test, key.fog,
@@ -962,7 +1255,7 @@ bool RsxBackend::setup_triangles(const DrawState& st, size_t count) {
     bool have[2] = {false, false};
     for (int u = 0; u < 2; u++) {
         if (!st.tex[u] || !(key.tex_mask & (1 << u))) continue;
-        have[u] = bind_texture(u, st.tex[u], st.tmap[u], bilinear, uvs[u], uvo[u], &st);
+        have[u] = bind_texture(u, st.tex[u], st.tmap[u], bilinear && !(key.three_point & (1 << u)), uvs[u], uvo[u], &st);
         if (!have[u] && st.tex[u]->fb_addr) return false;  // a frame we don't have: draw nothing rather than garbage
     }
     set_consts(draw_consts(st, alpha_threshold(st), have, uvs, uvo, bilinear ? 0.5f : 0.0f, inv_wf));
@@ -1035,9 +1328,13 @@ void RsxBackend::rect(const DrawState& st, float ulx, float uly, float lrx, floa
     ensure_cmd_space();
     phase = "rectangle: setup";
     ProgramKey key = make_program_key(st, fill);
+    if (!fill) apply_look(key, st);
+    // (Rectangles keep bilinear: their textures may be cropped after the program is chosen, which
+    // changes the size the 3-point filter needs.)
     if (textured && !copy_frame_pieces(st, key.tex_mask)) return;  // a frame we don't have: draw nothing
     Target* t = bind_target(st);
     if (!t) return;
+    draw_3d_ = false;
     const Program* p = program(key);
     note("%s %.1f,%.1f-%.1f,%.1f target 0x%06X: program mode %d comb %06X:%08X tex %d %s, om %06X:%08X",
          fill ? "fill rect" : textured ? "texture rect" : "rect", ulx, uly, lrx, lry, st.cimg_addr, (int)key.mode,
@@ -1076,7 +1373,7 @@ void RsxBackend::rect(const DrawState& st, float ulx, float uly, float lrx, floa
                     cp = crop;
                 }
             }
-            have[u] = bind_texture(u, st.tex[u], st.tmap[u], bilinear, uvs[u], uvo[u], nullptr, cp);
+            have[u] = bind_texture(u, st.tex[u], st.tmap[u], bilinear && !(key.three_point & (1 << u)), uvs[u], uvo[u], nullptr, cp);
             if (!have[u] && st.tex[u]->fb_addr) return;  // a frame we don't have: draw nothing rather than garbage
         }
     float shade[4] = {0, 0, 0, 0};
@@ -1189,6 +1486,7 @@ void RsxBackend::end_dl() {
     }
     rsxSetWriteBackendLabel(ctx_, kLabelDl, ++dl_seq_);
     if ((dl_seq_ & 63) == 0) { evict_mips(); evict_targets(); }
+    take_hd();
     if (scratch_pos_) scratch_done_[scratch_half_] = dl_seq_;  // its frame copies are free once this label is written
     rsxFlushBuffer(ctx_);
     if (dls_fenced_ < fence_dls) {
@@ -1203,6 +1501,9 @@ void RsxBackend::end_dl() {
 }
 
 void RsxBackend::texture_evicted(Texture& tex) {
+    // Its pack picture's Job goes with it (the picture itself stays, by its own key, for the texture's
+    // next hash): hd_jobs_ grew with every texture hash seen, ~30,000 in 8 minutes (v72's bad_alloc).
+    if (!hd_jobs_.empty()) hd_jobs_.erase(tex.hash);
     if (tex.backend_data) {
         free_queue_.push_back({dl_seq_, (RsxTex*)tex.backend_data});
         tex.backend_data = nullptr;
@@ -1213,7 +1514,7 @@ void RsxBackend::free_textures_done() {
     uint32_t done = *label(kLabelDl);
     for (size_t i = 0; i < free_queue_.size();) {
         if (free_queue_[i].first <= done) {
-            vram_.free(free_queue_[i].second->mem);
+            free_vram(free_queue_[i].second->mem);
             delete free_queue_[i].second;
             free_queue_[i] = free_queue_.back();
             free_queue_.pop_back();
@@ -1242,6 +1543,16 @@ namespace {
 
 bool RsxBackend::present(const ViInfo& vi) {
     if (hung_) return false;
+    // The last picture not on screen yet (the RSX still on what came before it): wait a little, then
+    // leave this VI out rather than hold up the thread that brings the game its VIs (v87 at 60 fps:
+    // 8-14 ms waits every VI, the game slowed and its sound ran short). Nothing is used up here, so
+    // the next VI shows what this one would have.
+    if (flip_pending()) {
+        const uint64_t t0 = __mftb(), limit = sysGetTimebaseFrequency() * 3 / 1000;
+        while (flip_pending() && __mftb() - t0 < limit) usleep(100);
+        stats.t_flip += __mftb() - t0;
+        if (flip_pending()) { stats.present_busy++; return false; }
+    }
     ensure_cmd_space();
     // The target holding the VI origin: the nearest one at or below the address.
     uint32_t origin = vi.origin & 0xFFFFFF;
@@ -1249,11 +1560,14 @@ bool RsxBackend::present(const ViInfo& vi) {
     if (it == targets_.begin()) return false;
     --it;
     Target* tp = &it->second;
+    // The old-film look: in grey if this list drew it; an in-between frame as its frame (v92 at 60 fps:
+    // its in-between frames, never marked, came up in colour every other refresh).
+    const bool film = tp->film_dl == tp->drawn_dl;
     uint32_t row_bytes = tp->width_n64 * tp->bpp;
     if (origin >= tp->addr + row_bytes * tp->height_n64) return false;
     // Frame interpolation: the image's in-between frame first (the image itself stays to be shown next).
     auto mid = mid_targets_.find(tp->addr);
-    if (mid != mid_targets_.end() && mid->second.mid_ready && mid->second.width_n64 == tp->width_n64) {
+    if (mid != mid_targets_.end() && mid->second.mid_ready && mid->second.width_n64 == tp->width_n64 && mid->second.drawn_dl >= tp->drawn_dl) {
         mid->second.mid_ready = false;
         tp = &mid->second;
         stats.mid_presents++;
@@ -1302,17 +1616,38 @@ bool RsxBackend::present(const ViInfo& vi) {
     // Draw onto the display buffer (rsxutil's), then flip.
     begin_display();
     ProgramKey key;
-    key.mode = t.film_dl == t.drawn_dl ? ProgramMode::Gray : ProgramMode::Copy;  // the old-film look
+    key.mode = film ? ProgramMode::Gray : ProgramMode::Copy;  // the old-film look
     key.tex_mask = 1;
+    if (n64_look && key.mode == ProgramMode::Copy) key.soft_w = (uint16_t)(t.width_n64 + 2 * t.margin);  // the video output's softness
     const Program* p = program(key);
     if (!p) return false;
     load_fp((rsxFragmentProgram*)p->blob.data(), p->offset);
-    load_display_texture(t.color_off, t.w, t.h, t.pitch);
+    load_display_texture(t.color_off, t.w * t.sx, t.h * t.sy, t.pitch);  // filtered: the samples averaged
     // Widescreen: the margins too, across the whole display.
     display_quad(fw, fh, (sw + 2 * t.margin) / (float)(t.width_n64 + 2 * t.margin), row0 / t.height_n64, (row0 + sh) / t.height_n64,
                  t.margin != 0);
+    if (stereo_on) {
+        const uint32_t right = t.color_off + t.h * t.sy * t.pitch;
+        const float u1 = (sw + 2 * t.margin) / (float)(t.width_n64 + 2 * t.margin), v0 = row0 / t.height_n64, v1 = (row0 + sh) / t.height_n64;
+        if (t.eyes == 2 && ghost_ > 0 && ghost_off_ && !film) {
+            // Ghost cancellation: each eye drawn again from both pictures (its own less some of the other's).
+            load_fp((rsxFragmentProgram*)ghost_blob_.data(), ghost_off_);
+            load_display_texture(right, t.w * t.sx, t.h * t.sy, t.pitch, 1);
+            display_quad(fw, fh, u1, v0, v1, t.margin != 0);
+            setRenderTargetEye(curr_fb, 1);
+            load_display_texture(right, t.w * t.sx, t.h * t.sy, t.pitch, 0);
+            load_display_texture(t.color_off, t.w * t.sx, t.h * t.sy, t.pitch, 1);
+            display_quad(fw, fh, u1, v0, v1, t.margin != 0);
+        } else {
+            // 3D: the right eye's picture (below the left eye's in a 3D image; else the same one).
+            setRenderTargetEye(curr_fb, 1);
+            if (t.eyes == 2) load_display_texture(right, t.w * t.sx, t.h * t.sy, t.pitch);
+            display_quad(fw, fh, u1, v0, v1, t.margin != 0);
+        }
+        setRenderTargetEye(curr_fb, 0);
+    }
     phase = "flip";
-    { uint64_t t0 = __mftb(); flip(); stats.t_flip += __mftb() - t0; }  // waits for the previous flip, queues this one
+    { uint64_t t0 = __mftb(); flip_queue(); stats.t_flip += __mftb() - t0; }  // queues it (the previous one is on screen: see above)
     phase = "after flip";
     bound_ = nullptr;
     stats.presents++;
@@ -1332,12 +1667,20 @@ void RsxBackend::show_black() {
 }
 
 void RsxBackend::begin_display() {
+    settle_flip_wait();  // the display buffer drawn next is on screen until the last flip happens
     reset_state();
     setRenderTarget(curr_fb);
+    rsxSetAntialiasingControl(ctx_, GCM_FALSE, GCM_FALSE, GCM_FALSE, 0xFFFF);
     bound_ = nullptr;
     rsxSetColorMask(ctx_, GCM_COLOR_MASK_B | GCM_COLOR_MASK_G | GCM_COLOR_MASK_R | GCM_COLOR_MASK_A);
     rsxSetClearColor(ctx_, 0);
     rsxSetScissor(ctx_, 0, 0, (u16)display_width, (u16)display_height);
+    if (stereo_on) {
+        // 3D: the right eye's lines cleared too (the left eye's are bound again after).
+        setRenderTargetEye(curr_fb, 1);
+        rsxClearSurface(ctx_, GCM_CLEAR_R | GCM_CLEAR_G | GCM_CLEAR_B | GCM_CLEAR_A);
+        setRenderTargetEye(curr_fb, 0);
+    }
     rsxClearSurface(ctx_, GCM_CLEAR_R | GCM_CLEAR_G | GCM_CLEAR_B | GCM_CLEAR_A);
     rsxSetBlendEnable(ctx_, GCM_FALSE);
     rsxSetDepthTestEnable(ctx_, GCM_FALSE);
@@ -1350,7 +1693,7 @@ void RsxBackend::begin_display() {
     rsxSetViewport(ctx_, 0, 0, (u16)display_width, (u16)display_height, 0.0f, 1.0f, s, o);
 }
 
-void RsxBackend::load_display_texture(uint32_t offset, uint32_t w, uint32_t h, uint32_t pitch) {
+void RsxBackend::load_display_texture(uint32_t offset, uint32_t w, uint32_t h, uint32_t pitch, u8 unit) {
     gcmTexture tx;
     std::memset(&tx, 0, sizeof tx);
     tx.format = GCM_TEXTURE_FORMAT_A8R8G8B8 | GCM_TEXTURE_FORMAT_LIN;
@@ -1372,10 +1715,10 @@ void RsxBackend::load_display_texture(uint32_t offset, uint32_t w, uint32_t h, u
     tx.pitch = pitch;
     tx.offset = offset;
     rsxInvalidateTextureCache(ctx_, GCM_INVALIDATE_TEXTURE);
-    rsxLoadTexture(ctx_, 0, &tx);
-    rsxTextureControl(ctx_, 0, GCM_TRUE, 0 << 8, 12 << 8, GCM_TEXTURE_MAX_ANISO_1);
-    rsxTextureFilter(ctx_, 0, 0, GCM_TEXTURE_LINEAR, GCM_TEXTURE_LINEAR, GCM_TEXTURE_CONVOLUTION_QUINCUNX);
-    rsxTextureWrapMode(ctx_, 0, GCM_TEXTURE_CLAMP_TO_EDGE, GCM_TEXTURE_CLAMP_TO_EDGE, GCM_TEXTURE_CLAMP_TO_EDGE, 0,
+    rsxLoadTexture(ctx_, unit, &tx);
+    rsxTextureControl(ctx_, unit, GCM_TRUE, 0 << 8, 12 << 8, GCM_TEXTURE_MAX_ANISO_1);
+    rsxTextureFilter(ctx_, unit, 0, GCM_TEXTURE_LINEAR, GCM_TEXTURE_LINEAR, GCM_TEXTURE_CONVOLUTION_QUINCUNX);
+    rsxTextureWrapMode(ctx_, unit, GCM_TEXTURE_CLAMP_TO_EDGE, GCM_TEXTURE_CLAMP_TO_EDGE, GCM_TEXTURE_CLAMP_TO_EDGE, 0,
                        GCM_TEXTURE_ZFUNC_LESS, 0);
 }
 
@@ -1409,39 +1752,124 @@ void RsxBackend::display_quad(float fw, float fh, float u1, float v0, float v1, 
 }
 
 void RsxBackend::alloc_scratch() {
-    scratch_size_ = scratch_bytes(scale_);
+    // 3D: every frame piece is copied once per eye, so twice the room (v105: the drunk blur's ~140
+    // pieces a list overflowed 7 MB halves, 1836 pieces dropped, and its loop kept the damage).
+    scratch_size_ = scratch_bytes(scale_) * (stereo_on ? 2 : 1);
     scratch_ = (uint8_t*)vram_.alloc(scratch_size_, 4096);
     if (!scratch_) { scratch_size_ = 8u * 1024 * 1024; scratch_ = (uint8_t*)vram_.alloc(scratch_size_, 4096); }
     if (scratch_) rsxAddressToOffset(scratch_, &scratch_off_);
     else scratch_size_ = 0;
+    std::printf("[gfx] frame copies: %u MB of RSX memory (two halves)\n", scratch_size_ >> 20);
     scratch_pos_ = 0;
     scratch_done_[0] = scratch_done_[1] = 0;
 }
 
-const RsxBackend::DepthBuf* RsxBackend::depth_for(uint32_t w, uint32_t h, bool* fresh) {
+// A surface's memory: tiled when it's frame-sized and a tile region is free (see tiles_), else in rows.
+void* RsxBackend::alloc_surface(uint32_t row_bytes, uint32_t rows, uint32_t* pitch) {
+    // The pitches a tile region can have (the RSX's table).
+    static const uint32_t kPitches[] = {0x200, 0x300, 0x400, 0x500, 0x600, 0x700, 0x800, 0xA00, 0xC00, 0xD00, 0xE00, 0x1000,
+                                        0x1400, 0x1800, 0x1A00, 0x1C00, 0x2000, 0x2800, 0x3000, 0x3400, 0x3800, 0x4000, 0x5000,
+                                        0x6000, 0x6800, 0x7000, 0x8000, 0xA000, 0xC000, 0xD000, 0xE000, 0x10000};
+    if (tiling && row_bytes >= 256 * 4 && rows >= 200) {
+        int index = -1;
+        for (int i = 0; i < 15; i++) if (!(tiles_used_ & (1u << i))) { index = i; break; }
+        uint32_t tp = 0;
+        for (uint32_t p : kPitches) if (p >= row_bytes) { tp = p; break; }
+        if (index >= 0 && tp) {
+            // Whole blocks of rows (v76): the RSX lays a tile region out in blocks and writes the last one
+            // whole, so 1,200 rows took 1,216 rows' room; reserving only 1,200 let the depth buffer's
+            // clears run into the next allocation (v74/v75's yellow bar: 0xFFFFFF00, the cleared depth,
+            // at the top of the frame after it; and v74's rain and fire marks, from the colour images).
+            const uint32_t size = align_up(tp * align_up(rows, 64), 0x10000);
+            void* mem = vram_.alloc(size, 0x10000);
+            if (mem) {
+                u32 off = 0;
+                rsxAddressToOffset(mem, &off);
+                if (gcmSetTileInfo((u8)index, GCM_LOCATION_RSX, off, size, tp, GCM_COMPMODE_DISABLED, 0, 0) == 0 && gcmBindTile((u8)index) == 0) {
+                    tiles_used_ |= (uint16_t)(1u << index);
+                    tiles_[mem] = (uint8_t)index;
+                    tiles_bound_total_++;
+                    *pitch = tp;
+                    return mem;
+                }
+                vram_.free(mem);
+            }
+        }
+        tiles_refused_++;
+    }
+    *pitch = align_up(row_bytes, 64);
+    return vram_.alloc(*pitch * rows, 4096);
+}
+
+// Frees RSX memory (the RSX is done with it); a tile region over it is let go first.
+void RsxBackend::free_vram(void* mem) {
+    if (!mem) return;
+    auto it = tiles_.find(mem);
+    if (it != tiles_.end()) {
+        gcmUnbindTile(it->second);
+        tiles_used_ &= (uint16_t)~(1u << it->second);
+        tiles_.erase(it);
+    }
+    vram_.free(mem);
+}
+
+const RsxBackend::DepthBuf* RsxBackend::depth_for(uint32_t w, uint32_t h, uint32_t sx, uint32_t sy, bool* fresh) {
+    w *= sx; h *= sy;  // multisampled: a depth per sample
     const uint64_t key = (uint64_t)w << 32 | h;
     auto it = depths_.find(key);
     if (it != depths_.end()) return &it->second;
     DepthBuf d;
     d.pitch = align_up(w * 4, 64);
-    d.mem = vram_.alloc(d.pitch * h, 4096);
+    d.mem = alloc_surface(w * 4, h, &d.pitch);
     if (!d.mem) return nullptr;
     rsxAddressToOffset(d.mem, &d.off);
     *fresh = true;
     return &(depths_[key] = d);
 }
 
+// The sample layout for new images: anti-aliasing on, 4 samples (rotated grid) at 432 and 648 lines,
+// 2 (diagonal) at 864, none at 1080.
+void RsxBackend::aa_layout(uint8_t* mode, uint8_t* sx, uint8_t* sy) const {
+    *mode = GCM_SURFACE_CENTER_1; *sx = 1; *sy = 1;
+    if (!antialias_ || scale_ >= 5) return;
+    if (scale_ <= 3) { *mode = GCM_SURFACE_SQUARE_ROTATED_4; *sx = 2; *sy = 2; }
+    else { *mode = GCM_SURFACE_DIAGONAL_CENTERED_2; *sx = 2; }
+}
+
+bool RsxBackend::set_antialias(bool on) {
+    if (on == antialias_ || hung_) return !hung_;
+    antialias_ = on;
+    if (!reset_images("an anti-aliasing change")) return false;
+    alloc_scratch();
+    uint8_t m, sx, sy;
+    aa_layout(&m, &sx, &sy);
+    std::printf("[gfx] anti-aliasing %s: %u sample(s) a pixel at %u lines\n", on ? "on" : "off", sx * sy, 216 * scale_);
+    return true;
+}
+
 bool RsxBackend::set_scale(uint32_t scale) {
     if (scale == scale_ || hung_) return !hung_;
-    // Everything drawn at the old scale goes (the RSX finishes with it first); the next frames are
-    // drawn at the new one.
+    if (!reset_images("a resolution change")) return false;
+    scale_ = scale;
+    alloc_scratch();
+    stats.scratch_max_kb = 0;
+    uint8_t m, sx, sy;
+    aa_layout(&m, &sx, &sy);
+    std::printf("[gfx] resolution: %u lines (render scale %u%s); frame texture memory %u MB; RSX memory %u of %u MB in use\n",
+                216 * scale, scale, sx * sy == 4 ? ", 4x anti-aliasing" : sx * sy == 2 ? ", 2x anti-aliasing" : "", scratch_size_ >> 20,
+                (unsigned)(vram_.in_use() >> 20), stats.vram_mb);
+    return true;
+}
+
+// Everything drawn goes (the RSX finishes with it first); the next frames are drawn anew.
+bool RsxBackend::reset_images(const char* why) {
     ensure_cmd_space();
-    if (!fence("a resolution change")) return false;
+    if (!fence(why)) return false;
     for (auto* m : {&targets_, &mid_targets_}) {
-        for (auto& [a, t] : *m) vram_.free(t.color);
+        for (auto& [a, t] : *m) free_vram(t.color);
         m->clear();
     }
-    for (auto& [k, d] : depths_) vram_.free(d.mem);
+    for (auto& [k, d] : depths_) free_vram(d.mem);
     depths_.clear();
     vram_.free(scratch_);
     scratch_ = nullptr;
@@ -1451,11 +1879,6 @@ bool RsxBackend::set_scale(uint32_t scale) {
     const bool vp = cache_.vp_loaded;
     cache_ = StateCache{};
     cache_.vp_loaded = vp;
-    scale_ = scale;
-    alloc_scratch();
-    stats.scratch_max_kb = 0;
-    std::printf("[gfx] resolution: %u lines (render scale %u); frame texture memory %u MB; RSX memory %u of %u MB in use\n",
-                216 * scale, scale, scratch_size_ >> 20, (unsigned)(vram_.in_use() >> 20), stats.vram_mb);
     return true;
 }
 
@@ -1525,16 +1948,18 @@ bool RsxBackend::save_target(uint32_t addr, bool mid, const char* path) {
     if (it == m.end()) return false;
     const Target& t = it->second;
     if (!fence("saving a target")) return false;
-    const uint32_t w = t.width_n64 + 2 * t.margin, h = t.height_n64;
+    // 3D: both eyes, the left eye's picture on the left.
+    const uint32_t eye_w = t.width_n64 + 2 * t.margin, h = t.height_n64, w = eye_w * t.eyes;
     std::vector<uint8_t> rgba((size_t)w * h * 4);
-    for (uint32_t y = 0; y < h; y++) {
-        const uint8_t* src = (const uint8_t*)t.color + (size_t)(y * scale_) * t.pitch;
-        for (uint32_t x = 0; x < w; x++) {
-            const uint8_t* p = src + (size_t)x * scale_ * 4;
-            uint8_t* d = &rgba[((size_t)y * w + x) * 4];
-            d[0] = p[1]; d[1] = p[2]; d[2] = p[3]; d[3] = 255;
+    for (uint32_t e = 0; e < t.eyes; e++)
+        for (uint32_t y = 0; y < h; y++) {
+            const uint8_t* src = (const uint8_t*)t.color + (size_t)(e * t.h * t.sy + y * scale_ * t.sy) * t.pitch;
+            for (uint32_t x = 0; x < eye_w; x++) {
+                const uint8_t* p = src + (size_t)x * scale_ * t.sx * 4;
+                uint8_t* d = &rgba[((size_t)y * w + e * eye_w + x) * 4];
+                d[0] = p[1]; d[1] = p[2]; d[2] = p[3]; d[3] = 255;
+            }
         }
-    }
     size_t len = 0;
     void* png = tdefl_write_image_to_png_file_in_memory_ex(rgba.data(), (int)w, (int)h, 4, &len, 6, MZ_FALSE);
     if (!png) return false;
@@ -1575,9 +2000,9 @@ bool RsxBackend::screenshot(const ViInfo& vi, const char* path) {
     if (!fence("a screenshot")) return false;
     std::vector<uint8_t> rgba((size_t)w * h * 4);
     for (uint32_t y = 0; y < h; y++) {
-        const uint8_t* src = (const uint8_t*)t.color + (size_t)((row0 + y) * scale_) * t.pitch;
+        const uint8_t* src = (const uint8_t*)t.color + (size_t)((row0 + y) * scale_ * t.sy) * t.pitch;
         for (uint32_t x = 0; x < w; x++) {
-            const uint8_t* p = src + (size_t)x * scale_ * 4;
+            const uint8_t* p = src + (size_t)x * scale_ * t.sx * 4;
             uint8_t* d = &rgba[((size_t)y * w + x) * 4];
             d[0] = p[1]; d[1] = p[2]; d[2] = p[3]; d[3] = 255;
         }
@@ -1602,7 +2027,7 @@ namespace {
 }
 
 // Draws two triangles covering the bound target with a hand-written fragment program (self-test).
-bool RsxBackend::test_draw(const char* name, const char* fp_source, uint32_t rgba, bool textured) {
+bool RsxBackend::test_draw(const char* name, const char* fp_source, uint32_t rgba, bool textured, const float* c7) {
     std::vector<uint8_t> blob;
     if (!fpasm::assemble(fp_source, blob)) { std::printf("[gfx] self-test: %s: program did not assemble\n", name); return false; }
     rsxFragmentProgram* fp = (rsxFragmentProgram*)blob.data();
@@ -1625,6 +2050,7 @@ bool RsxBackend::test_draw(const char* name, const char* fp_source, uint32_t rgb
     }
     (void)textured;
     identity_consts();
+    if (c7) { VpConsts k = vpc_; std::memcpy(k.c[7], c7, sizeof k.c[7]); set_consts(k); }
     draw(voff, 6);
     bool ok = fence(name);
     vram_.free(mem);
@@ -1797,6 +2223,128 @@ bool RsxBackend::self_test() {
         for (auto& kv : mips_) if (kv.second.rt) free_queue_.push_back({dl_seq_, kv.second.rt});
         mips_.clear();
     }
+    {
+        // Compressed textures (a texture pack's pictures): an 8x8 with a colour per quarter, as DXT1 and
+        // (see-through, so) as DXT5, each drawn over the target and its quarters read back.
+        static uint8_t src[8 * 8 * 4];
+        static Texture dt;
+        dt.rgba = src; dt.width = dt.height = 8; dt.hd_state = 1;
+        const uint32_t q[4] = {0xFF0000, 0x00FF00, 0x0000FF, 0xFFFFFF};
+        for (int pass = 0; pass < 2 && dxt_ok_; pass++) {
+            for (int y = 0; y < 8; y++) for (int x = 0; x < 8; x++) {
+                const uint32_t c = q[(y >= 4) * 2 + (x >= 4)];
+                uint8_t* p = src + (y * 8 + x) * 4;
+                p[0] = (uint8_t)(c >> 16); p[1] = (uint8_t)(c >> 8); p[2] = (uint8_t)c; p[3] = pass ? 200 : 255;
+            }
+            TexturePack::Ready ready;
+            TexturePack::prepare(std::vector<uint8_t>(src, src + sizeof src), 8, 8, false, true, &ready);
+            dt.hash = 0x6478743000000001ull + (uint64_t)pass;
+            RsxTex* rt = hd_texture(ready);
+            if (!rt) { dxt_ok_ = false; break; }
+            TexturePack::Job tj;
+            tj.offset = dt.hash;
+            hd_jobs_[dt.hash] = tj;
+            HdTex& e = hd_[hd_key(tj)];
+            e.rt = rt; e.last_used = dl_seq_; e.bytes = 0; e.w = 8; e.h = 8;
+            DrawState ds = st;
+            ds.om_h = 2u << 20;  // copy cycle
+            ds.om_l = 0;
+            ds.tex[0] = &dt; ds.tex[1] = nullptr;
+            ds.tmap[0] = TexMap{};
+            tex_rect(ds, 0, 0, 320, 240, 0, 0, 8.0f / 320.0f, 8.0f / 240.0f, false);
+            const bool ok = fence(pass ? "DXT5 texture" : "DXT1 texture");
+            const uint32_t a = pixel(t->color, t->pitch, t->w / 4, t->h / 4) & 0xFFFFFF, b = pixel(t->color, t->pitch, t->w * 3 / 4, t->h / 4) & 0xFFFFFF;
+            const uint32_t c = pixel(t->color, t->pitch, t->w / 4, t->h * 3 / 4) & 0xFFFFFF, d = pixel(t->color, t->pitch, t->w * 3 / 4, t->h * 3 / 4) & 0xFFFFFF;
+            const bool right = ok && ready.dxt == (pass ? 5 : 1) && a == q[0] && b == q[1] && c == q[2] && d == q[3];
+            std::printf("[gfx] self-test: %s texture: quarters %06X %06X / %06X %06X (want FF0000 00FF00 / 0000FF FFFFFF) %s\n", pass ? "DXT5" : "DXT1",
+                        (unsigned)a, (unsigned)b, (unsigned)c, (unsigned)d, right ? "right" : "WRONG");
+            if (!right) dxt_ok_ = false;
+        }
+        if (!dxt_ok_) std::printf("[gfx] self-test: compressed textures are off: a texture pack's pictures are kept uncompressed\n");
+        for (auto& kv : hd_) if (kv.second.rt) free_queue_.push_back({dl_seq_, kv.second.rt});
+        hd_.clear();
+        hd_jobs_.clear();
+        cache_.tex[0] = StateCache::Tex{};
+    }
+    {
+        // The "like the N64" look's 3-point filter (v83: the sizes are constants in the program).
+        auto near = [](uint32_t a, uint32_t b) {
+            for (int s = 0; s < 32; s += 8) { const int d = (int)((a >> s) & 255) - (int)((b >> s) & 255); if (d > 6 || d < -6) return false; }
+            return true;
+        };
+        bool ok = true;
+        // Then the filter itself: a 2x2 texture (black, red / green, blue) over the target through the
+        // drawing path with the look on; at a quarter in, 3-point gives (64, 64, 0), bilinear (48, 48, 16).
+        static uint8_t tp[2 * 2 * 4] = {0, 0, 0, 255, 255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255};
+        static Texture tt;
+        tt.rgba = tp; tt.width = tt.height = 2; tt.hash = 0x3370743000000001ull;
+        DrawState ts = st;
+        ts.om_h = (1u << 20) | (2u << 12);  // 2-cycle, bilinear
+        ts.om_l = 0;
+        ts.combine_hi = (15u << 20) | (31u << 15) | (7u << 12) | (7u << 9) | (15u << 5) | 31u;  // TEXEL0, then COMBINED
+        ts.combine_lo = (15u << 28) | (15u << 24) | (7u << 21) | (7u << 18) | (1u << 15) | (7u << 12) | (1u << 9) | (0u << 6) | (7u << 3) | 0u;
+        ts.tex[0] = &tt; ts.tex[1] = nullptr;
+        ts.tmap[0] = TexMap{};
+        ts.mip_levels = 0;
+        const bool look = n64_look;
+        const uint32_t dith = dither_off_;
+        n64_look = true; dither_off_ = 0;  // the filter alone
+        // In perspective (v85): the right side 4 times as far as the left (w 1 and 4), as game surfaces
+        // are; v80-v84's filter read its coordinates without perspective correction, which a square at
+        // one depth doesn't show.
+        const float xs[6] = {-1, 1, 1, -1, 1, -1}, ys[6] = {-1, -1, 1, -1, 1, 1};
+        OutVertex v[6];
+        for (int k = 0; k < 6; k++) {
+            const float w = xs[k] > 0 ? 4.0f : 1.0f;
+            v[k] = OutVertex{xs[k] * w, ys[k] * w, 0, w, (xs[k] + 1) * 0.5f, (1 - ys[k]) * 0.5f, {255, 255, 255, 255}};
+        }
+        draw_triangles(ts, v, 6);
+        ok = fence("3-point filter");
+        n64_look = look; dither_off_ = dith;
+        // Read a quarter and three quarters into the picture, which covers the 4:3 middle of the target
+        // (v83 read a quarter into the whole widescreen target: (s, t) = (0.17, 0.25) and (0.83, 0.75),
+        // which the filter got right, but the test didn't expect).
+        const uint32_t pw = t->w - 2 * t->xoff;
+        const uint32_t a = pixel(t->color, t->pitch, t->xoff + pw / 4, t->h / 4) & 0xFFFFFF,
+                       b = pixel(t->color, t->pitch, t->xoff + pw * 3 / 4, t->h * 3 / 4) & 0xFFFFFF;
+        // What the RDP's 3-point filter gives at a pixel: s perspective-correct across (w 1 to 4), t
+        // straight down (or up: the picture upside down); the 2x2 texture black, red / green, blue.
+        auto expect = [&](uint32_t px, uint32_t py, bool flip) -> uint32_t {
+            // Perspective-correct interpolation in whichever of the two triangles holds the pixel
+            // (v85 took t as straight down, which isn't so: the diagonal's far end has w 4 too).
+            const float X = 2 * (((float)(px - t->xoff) + 0.5f) / (float)pw) - 1;
+            const float ay = ((float)py + 0.5f) / (float)t->h, Y = flip ? 2 * ay - 1 : 1 - 2 * ay;
+            float fx = 0, fy = 0;
+            for (int tri = 0; tri < 2; tri++) {
+                const OutVertex* q = v + tri * 3;
+                float px_[3], py_[3];
+                for (int k = 0; k < 3; k++) { px_[k] = q[k].x / q[k].w; py_[k] = q[k].y / q[k].w; }
+                const float d = (py_[1] - py_[2]) * (px_[0] - px_[2]) + (px_[2] - px_[1]) * (py_[0] - py_[2]);
+                const float l0 = ((py_[1] - py_[2]) * (X - px_[2]) + (px_[2] - px_[1]) * (Y - py_[2])) / d;
+                const float l1 = ((py_[2] - py_[0]) * (X - px_[2]) + (px_[0] - px_[2]) * (Y - py_[2])) / d;
+                const float l[3] = {l0, l1, 1 - l0 - l1};
+                if (l[0] < -1e-4f || l[1] < -1e-4f || l[2] < -1e-4f) continue;
+                float iw = 0, sw = 0, tw = 0;
+                for (int k = 0; k < 3; k++) { iw += l[k] / q[k].w; sw += l[k] * q[k].s / q[k].w; tw += l[k] * q[k].t / q[k].w; }
+                fx = sw / iw; fy = tw / iw;
+                break;
+            }
+            float c[3];
+            if (fx + fy < 1) { c[0] = fx; c[1] = fy; c[2] = 0; }
+            else { c[0] = 1 - fy; c[1] = 1 - fx; c[2] = fx + fy - 1; }
+            uint32_t r = 0;
+            for (int k = 0; k < 3; k++) r = r << 8 | (uint32_t)(c[k] * 255 + 0.5f);
+            return r;
+        };
+        const uint32_t ax_ = t->xoff + pw / 4, bx_ = t->xoff + pw * 3 / 4, ay_ = t->h / 4, by_ = t->h * 3 / 4;
+        const uint32_t ua = expect(ax_, ay_, false), ub = expect(bx_, by_, false), fa = expect(ax_, ay_, true), fb = expect(bx_, by_, true);
+        const bool upright = near(a, ua) && near(b, ub), flipped = near(a, fa) && near(b, fb);
+        three_point_ok_ = ok && (upright || flipped);
+        std::printf("[gfx] self-test: 3-point filter in perspective (target %ux%u, margin %u): %06X %06X (want %06X %06X, or %06X %06X upside down) %s\n",
+                    (unsigned)t->w, (unsigned)t->h, (unsigned)t->xoff, (unsigned)a, (unsigned)b, (unsigned)ua, (unsigned)ub,
+                    (unsigned)fa, (unsigned)fb, three_point_ok_ ? "right" : "WRONG: the N64 look keeps bilinear filtering");
+        cache_.tex[0] = StateCache::Tex{};
+    }
     // 5. Drawing onto the display buffer (not shown: read back before any flip).
     {
         auto disp = [&](const char* name) {
@@ -1836,7 +2384,7 @@ bool RsxBackend::self_test() {
                 disp("checker texture quad");
             }
             // (c) the test render target as a texture (what present does).
-            load_display_texture(t->color_off, t->w, t->h, t->pitch);
+            load_display_texture(t->color_off, t->w * t->sx, t->h * t->sy, t->pitch);
             display_quad(1, 1, 1, 0, 1);
             disp("render target texture quad");
         }
@@ -1855,7 +2403,7 @@ bool RsxBackend::self_test() {
     auto it = targets_.find(kAddr);
     if (it != targets_.end()) {
         if (bound_ == &it->second) bound_ = nullptr;
-        vram_.free(it->second.color);
+        free_vram(it->second.color);
         targets_.erase(it);
     }
     if (tex.backend_data) { RsxTex* rt = (RsxTex*)tex.backend_data; vram_.free(rt->mem); delete rt; tex.backend_data = nullptr; }
