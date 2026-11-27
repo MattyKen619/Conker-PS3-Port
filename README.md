@@ -87,7 +87,7 @@ seconds and happens once). After that the USB drive isn't needed.
 Put a GLideN64 texture pack for the US version (a `.htc` file) in `/dev_hdd0/data/conker/` over FTP. The first
 time the game starts with it, it unpacks the pack once into `texture_pack.pack` in the same folder (this takes a
 while); after that it starts as usual. The **Textures** setting switches between the pack and the game's own
-textures. No texture pack is included: each player brings their own.
+textures. No texture pack is included: each player brings their own.  The one that has been tested is linked here https://www.n64textures.com/welcome/
 
 ## Settings
 
